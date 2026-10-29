@@ -8,7 +8,7 @@ Diagrams are embedded below; the PDF contains the typeset figures.
 
 ### Abstract
 
-DUAL is a single-image restoration backbone that combines local spatial attention, per-query neighborhood context, regional channel mixing, cross-scale self-exemplar retrieval, and image-conditioned convolution. Local layers use anchored windows with tabulated relative position bias. Context layers use 32 x 32 and 64 x 64 in-bounds neighborhoods and a stationary Fourier bias represented through query/key factor concatenation. A separate regional operator blends channel interactions across four shifted grids. Cross-scale retrieval reuses a shallow encoder on a filtered coarse image and transfers packed values into the trunk and reconstruction stream. At each group exit, a centered router mixes residual kernels into a reparameterized static base before convolution. This report specifies the current six-preset implementation, its scale-dependent reconstruction, initialization, and training/export contracts. It updates the earlier anchored-context description to the current neighborhood-attention design; it does not report new quality or runtime experiments.
+DUAL is a single-image restoration backbone that combines local spatial attention, per-query neighborhood context, regional channel mixing, cross-scale self-exemplar retrieval, and image-conditioned convolution. Local layers use anchored windows with tabulated relative position bias. Context layers use 32 x 32 and 64 x 64 in-bounds neighborhoods and a stationary Fourier bias represented through query/key factor concatenation. A separate regional operator blends channel interactions across four shifted grids. Cross-scale retrieval reuses a shallow encoder on a filtered coarse image and transfers packed values into the trunk and reconstruction stream. At each group exit, a centered router mixes residual kernels into a reparameterized static base before convolution. Six presets support 1x, 2x, and 4x restoration. This report details their architecture, scale-dependent reconstruction, initialization, and training and deployment behavior.
 
 ```mermaid
 flowchart TB
@@ -36,11 +36,9 @@ flowchart TB
 
 *Figure 1. DUAL data flow, with zero-based groups. CrossScaleRetrieval reads after group 1; SecondOctaveTransfer uses new values from the first reconstruction octave (a 2x spatial expansion). Arrows simplify residual and normalization paths.*
 
-### 1  Design and scope
+### 1  Design rationale
 
 The name DUAL emphasizes complementary spatial and regional channel attention. The architecture separates three types of adaptation: spatial attention chooses relationships between locations, regional attention mixes channels, and a global image summary changes group-exit kernels. These mechanisms have different supports and cannot be treated as interchangeable forms of attention. The design draws on restoration transformers, rank-factorized bias, cross-scale self-similarity, and dynamic convolution [1-6].
-
-This is a source-grounded technical report accompanying dual_arch.py, not a claim of state-of-the-art performance or a peer-reviewed publication. All figures are original schematics. The release contains architecture code rather than trained weights, a dataset, or a prescribed GAN training recipe.
 
 ## 2  Model family and residual hierarchy
 
@@ -106,15 +104,13 @@ flowchart TB
   NOTE["Neighboring queries have their own rectangles;<br/>no output overlap-add blending"] -.-> OUT
 ```
 
-*Figure 3. Current context attention. Each pixel owns a distinct in-bounds support; execution tiles share gathered storage, not the output prediction.*
+*Figure 3. Neighborhood context attention. Each pixel owns a distinct in-bounds support; execution tiles share gathered storage, not the output prediction.*
 
 For context size M, define kH=min(H,M), kW=min(W,M), aY(p)=clamp(pY-floor(kH/2),0,H-kH), and the analogous aX. S(p) is the rectangle [aY,aY+kH) x [aX,aX+kW). Near an edge the rectangle shifts inward rather than filling with invalid padding. If both axes fit inside M, the implementation uses a single full-image window. Otherwise, 16 x 16 query tiles are processed four at a time. A shared key union is masked separately for every query to recover S(p) exactly.
 
-### 3.1  What neighborhood attention changes
+### 3.1  Query-specific support
 
-Unlike fixed context-window ownership, the donor support follows each query [3]. Unlike overlap-add inference, DUAL does not evaluate several predictions for a pixel and blend them. The 16-pixel execution grid is not a context partition: its masks preserve per-query support. This distinction removes one source of hard context ownership, but does not prove the full network is seam-free. Local windows, cross-scale blocks, convolution borders, and PU2 remain distinct sources of finite-image behavior.
-
-context_na=True is the current default. context_overlap is a deprecated alias for this flag, not the former overlapping-window blending algorithm. Attention support is configuration, not a tensor encoded in the checkpoint.
+Each query has its own donor support [3]. The 16-pixel execution grid shares gathered storage while preserving that support through per-query masks. Each pixel produces one output, without overlap-add blending. Local windows, cross-scale blocks, convolution borders, and PU2 have separate boundary behavior.
 
 ## 4  Fourier bias and regional channel mixing
 
@@ -193,7 +189,7 @@ The key-count scaling in (5) changes logit magnitude, not donor identity. It doe
 
 ### 6.1  Edge-augmented reparameterized convolution
 
-The source names its edge-augmented reparameterized convolution EDBB. Dense stride-one 3 x 3 sites use its factors: two independent gain-two 1x1-3x3-1x1 branches, an expanded pointwise path, Sobel-x/Sobel-y/Laplacian edge branches, and an identity when channels match. Depthwise and ordinary pointwise operators are not replaced. Structural reparameterization and edge-oriented branches have established precedents [7,8].
+DUAL uses edge-augmented reparameterized convolution (EDBB) at dense stride-one 3 x 3 sites: two independent gain-two 1x1-3x3-1x1 branches, an expanded pointwise path, Sobel-x/Sobel-y/Laplacian edge branches, and an identity when channels match. Depthwise and ordinary pointwise operators are not replaced. Structural reparameterization and edge-oriented branches have established precedents [7,8].
 
 DUAL composes every branch differentiably in kernel space before applying the feature convolution. It does not materialize the gain-two intermediate feature maps. Composition uses FP32 for ordinary parameters and FP64 for double parameters, then casts back for convolution. The construction embeds the original dense operator at initialization in real arithmetic; additional factors can still change optimization. Parameter-space composition is not free: it adds arithmetic, storage, and autograd work.
 
@@ -243,45 +239,37 @@ prepare_for_export() folds static factors in FP64 on an eval copy and retains in
 | g_attention_impl | sdpa | Eager local attention path |
 | compile_g_attention_impl | direct | Eligible local path after preparation |
 
-Table 3. Current model defaults. Activation checkpointing is distinct from saving training state. Explicit configuration overrides remain effective.
+Table 3. Execution defaults. Activation checkpointing is distinct from saving training state. Explicit configuration overrides remain effective.
 
 prepare_for_compile(input_shape, input_dtype) selects execution paths by capability, not preset name or requested scale. In undeployed training with FP16/BF16 inputs, eligible full G16/G32 anchored dot-product layers can use the bundled dense-relative-bias Triton backend. Device, shape, dtype, mask, and mode are checked again at the call site. Unsupported geometry routes to SDPA with a warning; missing direct dependencies are reported when direct execution is requested.
 
-For eligible BF16 context training, images are folded into the head dimension so one tile mask is shared across images. Query/key width is 32+16, while the value width remains 32. The standard layout pads values with zero factor lanes and slices them afterward. Both layouts select the same neighborhoods and relative coordinates. CUDA, dtype, training state, deterministic-mode setting, and backend availability govern actual execution; a family-wide policy is not a universal GPU compatibility or speed guarantee.
+For eligible BF16 context training, images are folded into the head dimension so one tile mask is shared across images. Query/key width is 32+16, while the value width remains 32. The standard layout pads values with zero factor lanes and slices them afterward. Both layouts select the same neighborhoods and relative coordinates. CUDA, dtype, training state, deterministic-mode setting, and backend availability determine which execution path is used.
 
 ### 7.1  Selective rematerialization
 
 Image-wide QKV projection and output assembly stay outside the selective context checkpoint. Gathered tensors, positional factors, and masks can be regenerated; named fused SDPA outputs are retained by policy. If another attention backend is selected, the memory/recomputation behavior can differ. Whole-layer and context checkpointing may coexist, so the tradeoff must be measured in the actual training graph rather than inferred from a flag alone.
 
-### 7.2  Release and export boundary
+### 7.2  Export preparation
 
-The architecture file bundles its optional direct kernels and can import without traiNNer. PyTorch supplies SDPA and checkpoint APIs; optional Triton and torch.library APIs enable the direct path. Export preparation resets spatial routing to SDPA and disables the BF16 training layout before folding. The method prepares a model copy; it does not itself produce ONNX, a TensorRT engine, or a hardware-specific plugin. FlashAttention-style interfaces do not prove a particular fused backend was launched [9].
+The architecture file bundles its optional direct kernels and can import without traiNNer. PyTorch supplies SDPA and checkpoint APIs; optional Triton and torch.library APIs enable the direct path. Export preparation resets spatial routing to SDPA and disables the BF16 training layout before folding. The method prepares a model copy; it does not itself produce ONNX, a TensorRT engine, or a hardware-specific plugin.
 
 Call model.eval(), make a separate deep copy, then call prepare_for_export() on that copy. The DUAL method returns None. Keep the unfolded model and checkpoint for training or resumption.
 
-## 8  Reproducibility, changes, and limitations
+## 8  Integration and limitations
 
-### 8.1  What changed from the earlier report
+### 8.1  Checkpoints and integration
 
-The October 8 description used anchored ownership for context windows. The present default instead uses exact per-query neighborhoods with inward-shifted boundary support. Local G attention remains anchored. Regional channel attention still blends four shifted grids; that blending should not be confused with the removed overlap-add context approach. The execution policy now covers all six presets and all three scales through capability checks. Whole-layer and selective context checkpointing default on; regional core checkpointing defaults off.
-
-### 8.2  Checkpoint and integration contract
-
-Select the correct factory, requested scale, and structural options before loading an unfolded state dictionary. Load strictly when the intended architecture matches. Non-tensor settings such as context_na and window sizes are not fully described by parameter shapes. A successful load therefore proves matching keys/shapes, not equivalence to the function used to train an older checkpoint. Save architecture configuration alongside weights. The published family has Light, XS, S, M, L, and XL; no retired legacy preset is included.
+Select the factory, requested scale, and structural options before loading an unfolded state dictionary. Load strictly when the architecture matches. Settings such as context_na and window sizes are not fully described by parameter shapes, so store the architecture configuration alongside the weights.
 
 For traiNNer integration, place the single file in traiNNer/archs and select its registered factory in network_g. Avoid simultaneously importing an older module that registers the same names. Keep precision, color convention, output clipping, padding, and tiling choices explicit in inference tooling. The architecture itself does not clamp its RGB output to a display range.
 
-### 8.3  Finite-image and numerical limits
+### 8.2  Finite-image and numerical limits
 
 Neighborhood context is bounded; it is not global attention. PU2 changes phase handling and the relation between trunk pixels and input pixels. Local-window ownership, cross-scale block boundaries, convolution padding, and image-wide routing prevent a blanket claim of exact translation equivariance. Independently tiled inference changes both available donors and routing statistics, so it is not generally identical to whole-image inference. Parameter-compatible changes to support can also change texture behavior.
 
-Kernel composition, factor concatenation, and layout changes are described algebraically. Floating-point accumulation order and casts can produce different results, gradients, and subsequent training trajectories. This report provides no new PSNR, SSIM, perceptual-quality, latency, or peak-memory measurements. Neither the absence of a fixed context partition nor a successful export is proof of artifact-free restoration.
+Kernel composition, factor concatenation, and layout changes preserve the stated algebra, but floating-point accumulation and casts can affect outputs and gradients. This report describes the architecture; it does not present quality or runtime benchmarks.
 
-### 8.4  Evaluation requirements
-
-A quantitative study should disclose the dataset/degradation, loss stack, crop, effective batch, optimizer, schedule, seeds, checkpoint selection, color/crop convention, and matched visual examples. Runtime reporting should specify device, software versions, precision, shape, batch, backend, folding, tiling, warmup, and timing scope. Separate training cost from folded inference cost. Such measurements remain future evidence, not results supplied by this architectural description.
-
-### 8.5  Terminology guide
+### 8.3  Terminology
 
 | Notation | Meaning |
 |---|---|
@@ -290,30 +278,22 @@ A quantitative study should disclose the dataset/degradation, loss stack, crop, 
 | RFB / RPB | Relative Fourier bias / tabulated relative position bias. |
 | PU2 / F64 | PixelUnshuffle by 2 / reconstruction width of 64 channels. |
 | Q / K / V | Query / key / value projections; their origins are specified for each operator. |
-| Octave | One 2x spatial-resolution step, not an extra video frame. |
-
-### Implementation and attribution
-
-The accompanying dual_arch.py is the source of truth for this release. This paper contains the architecture explanation, diagrams, and integration notes. Applicable code notices are consolidated in LICENSE. References credit the specific methods discussed; their benchmark results are not transferred to DUAL.
-
-Author: Rift73. Documentation and original schematic preparation were assisted by Codex, with a visual-design review by Claude Opus 5.5. This technical report accompanies the architecture source in PDF and Markdown formats.
+| Octave | One 2x spatial-resolution step. |
 
 ## References
 
-[1] D. Lee, S. Yun, J. Im, and Y. Ro. Rank-Factorized Implicit Neural Bias: Scaling Super-Resolution Transformer with FlashAttention. 2026. [arXiv:2603.06738](https://arxiv.org/abs/2603.06738). Factor-concatenation and cyclic local/context attention antecedents.
+[1] D. Lee, S. Yun, J. Im, and Y. Ro. Rank-Factorized Implicit Neural Bias: Scaling Super-Resolution Transformer with FlashAttention. 2026. [arXiv:2603.06738](https://arxiv.org/abs/2603.06738).
 
-[2] J. Liang et al. SwinIR: Image Restoration Using Swin Transformer. ICCV Workshops, 2021. [arXiv:2108.10257](https://arxiv.org/abs/2108.10257). Windowed restoration transformer context.
+[2] J. Liang et al. SwinIR: Image Restoration Using Swin Transformer. ICCV Workshops, 2021. [arXiv:2108.10257](https://arxiv.org/abs/2108.10257).
 
-[3] A. Hassani et al. Neighborhood Attention Transformer. CVPR, 2023. [arXiv:2204.07143](https://arxiv.org/abs/2204.07143). Sliding per-query neighborhood attention; DUAL does not depend on NATTEN.
+[3] A. Hassani et al. Neighborhood Attention Transformer. CVPR, 2023. [arXiv:2204.07143](https://arxiv.org/abs/2204.07143).
 
-[4] S. W. Zamir et al. Restormer: Efficient Transformer for High-Resolution Image Restoration. CVPR, 2022. [arXiv:2111.09881](https://arxiv.org/abs/2111.09881). Channel/transposed attention antecedent.
+[4] S. W. Zamir et al. Restormer: Efficient Transformer for High-Resolution Image Restoration. CVPR, 2022. [arXiv:2111.09881](https://arxiv.org/abs/2111.09881).
 
-[5] Y. Mei et al. Image Super-Resolution with Cross-Scale Non-Local Attention and Exhaustive Self-Exemplars Mining. CVPR, 2020. [arXiv:2006.01424](https://arxiv.org/abs/2006.01424). Cross-scale self-exemplar motivation.
+[5] Y. Mei et al. Image Super-Resolution with Cross-Scale Non-Local Attention and Exhaustive Self-Exemplars Mining. CVPR, 2020. [arXiv:2006.01424](https://arxiv.org/abs/2006.01424).
 
-[6] Y. Chen et al. Dynamic Convolution: Attention over Convolution Kernels. CVPR, 2020. [arXiv:1912.03458](https://arxiv.org/abs/1912.03458). Input-dependent kernel aggregation.
+[6] Y. Chen et al. Dynamic Convolution: Attention over Convolution Kernels. CVPR, 2020. [arXiv:1912.03458](https://arxiv.org/abs/1912.03458).
 
-[7] X. Ding, X. Zhang, J. Han, and G. Ding. Diverse Branch Block: Building a Convolution as an Inception-like Unit. CVPR, 2021. [arXiv:2103.13425](https://arxiv.org/abs/2103.13425). Structural reparameterization.
+[7] X. Ding, X. Zhang, J. Han, and G. Ding. Diverse Branch Block: Building a Convolution as an Inception-like Unit. CVPR, 2021. [arXiv:2103.13425](https://arxiv.org/abs/2103.13425).
 
-[8] X. Zhang, H. Zeng, and L. Zhang. Edge-oriented Convolution Block for Real-time Super Resolution on Mobile Devices. ACM Multimedia, 2021. [Official ECBSR repository](https://github.com/xindongzhang/ECBSR). Edge-oriented linear branches.
-
-[9] T. Dao et al. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. NeurIPS, 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135). Attention execution and IO considerations.
+[8] X. Zhang, H. Zeng, and L. Zhang. Edge-oriented Convolution Block for Real-time Super Resolution on Mobile Devices. ACM Multimedia, 2021. [Official ECBSR repository](https://github.com/xindongzhang/ECBSR).
