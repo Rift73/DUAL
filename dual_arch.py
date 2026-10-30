@@ -35,9 +35,13 @@ Execution:
     direct local-attention backend and a mask-sharing BF16 context layout.
     The same execution policy applies to every preset and output scale; runtime
     device, dtype and attention geometry determine which backend can execute.
-    Selective context checkpointing defaults on throughout the family; set
-    context_checkpoint=False to trade additional memory for less recomputation.
-    Whole-layer checkpointing defaults on; dual-core checkpointing defaults off.
+    use_checkpoint=True enables selective whole-layer checkpointing in training:
+    save expensive attention results and recompute surrounding intermediates.
+    Set it to False to disable explicit checkpointing. Eval/export never use it.
+    attn_type="masked" keeps SDPA; opt-in "hybrid" uses Flex for compiled BF16
+    masked context NA only. Unmasked attention, eager/eval and export keep SDPA.
+    Hybrid requires PyTorch Flex/Triton and prepare_for_compile(input_shape,
+    input_dtype) after moving the model to CUDA; traiNNer calls this hook.
     These execution options do not promise bitwise equivalence across backends.
     prepare_for_export() requires an eval copy and folds static EDBB factors
     in-place. Dynamic routing remains input-dependent; never fold for training.
@@ -59,9 +63,10 @@ from __future__ import annotations
 
 import math
 import warnings
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Literal
 
 import torch
@@ -73,6 +78,13 @@ from torch.utils.checkpoint import (
     checkpoint,
     create_selective_checkpoint_contexts,
 )
+
+try:
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+except ImportError:
+    create_block_mask = flex_attention = None
+
+_FLEX_ATTENTION_OP = getattr(torch.ops.higher_order, "flex_attention", None)
 
 __all__ = [  # noqa: RUF022 - Keep public presets in family order.
     "DUAL",
@@ -88,19 +100,47 @@ __all__ = [  # noqa: RUF022 - Keep public presets in family order.
 # Shared initialization, precision and window geometry.
 
 
-def _na_checkpoint_policy(
+def _selective_checkpoint_policy(
     ctx: Any, op: Any, *args: Any, **kwargs: Any
 ) -> CheckpointPolicy:
-    """Save fused SDPA outputs, not its large duplicated gathered inputs."""
+    """Retain attention results while rematerializing the rest of each layer."""
     del ctx, args, kwargs
     saved = (
+        torch.ops.aten._scaled_dot_product_flash_attention.default,  # noqa: SLF001
         torch.ops.aten._scaled_dot_product_efficient_attention.default,  # noqa: SLF001
         torch.ops.aten._scaled_dot_product_cudnn_attention.default,  # noqa: SLF001
         torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,  # noqa: SLF001
     )
-    return (
-        CheckpointPolicy.MUST_SAVE if op in saved else CheckpointPolicy.PREFER_RECOMPUTE
-    )
+    if op in saved or (_FLEX_ATTENTION_OP is not None and op is _FLEX_ATTENTION_OP):
+        return CheckpointPolicy.MUST_SAVE
+    if (
+        _HAS_DIRECT_ATTENTION
+        and op is torch.ops.dual_standalone.dense_rpb_attention.default
+    ):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _checkpoint_layer(layer: nn.Module, x: Tensor) -> Tensor:
+    """One selective checkpoint boundary, shared by fine and coarse execution."""
+    context = nullcontext()
+    if not torch.compiler.is_compiling() and torch.is_autocast_enabled(x.device.type):
+        # Shared prefix weights may already be in eager AMP's cast cache.
+        # Recompute must see the same casts as the recorded forward region.
+        context = torch.autocast(
+            x.device.type,
+            dtype=torch.get_autocast_dtype(x.device.type),
+            cache_enabled=False,
+        )
+    with context:
+        return checkpoint(
+            layer,
+            x,
+            use_reentrant=False,
+            context_fn=partial(
+                create_selective_checkpoint_contexts, _selective_checkpoint_policy
+            ),
+        )
 
 
 def _init_weights(module: nn.Module) -> None:
@@ -511,6 +551,63 @@ def _na_coordinates(height: int, width: int, device: torch.device) -> Tensor:
     return torch.stack((yy, xx), dim=-1).reshape(-1, 2)
 
 
+@lru_cache(maxsize=16)
+def _inference_na_coordinates(height: int, width: int, device: torch.device) -> Tensor:
+    """Reuse small, read-only integer grids, never weights or attention masks.
+
+    Normal tensors remain safe if a later caller needs autograd. Training and
+    compiled/export paths bypass this bounded eager-inference cache.
+    """
+    with torch.inference_mode(False):
+        return _na_coordinates(height, width, device)
+
+
+def _na_block_mask(
+    height: int, width: int, window: int, first: int, device: torch.device
+) -> Any:
+    """Build one immutable four-tile Flex mask outside the compiled graph.
+
+    Rows use clamped query coordinates and inward-shifted donor origins, exactly
+    like _na_chunk. Image batches share this geometry through the head axis.
+    The callback captures integer geometry only, never learned Fourier factors.
+    """
+    if create_block_mask is None:
+        raise ImportError("DUAL hybrid attention requires PyTorch Flex Attention")
+    kh, kw = min(height, window), min(width, window)
+    uh, uw = min(height, kh + 15), min(width, kw + 15)
+    tiles = [(y, x) for y in range(0, height, 16) for x in range(0, width, 16)]
+    current = tiles[first : first + 4]
+    with torch.inference_mode(False), torch.no_grad():
+        origins = torch.tensor(current, device=device, dtype=torch.int64)
+
+        def mask_mod(b, h, q, k):
+            oy, ox = origins[b, 0], origins[b, 1]
+            qy = (oy + q // 16).clamp(max=height - 1)
+            qx = (ox + q % 16).clamp(max=width - 1)
+            ky = (oy - kh // 2).clamp(0, height - uh) + k // uw
+            kx = (ox - kw // 2).clamp(0, width - uw) + k % uw
+            sy = (qy - kh // 2).clamp(0, height - kh)
+            sx = (qx - kw // 2).clamp(0, width - kw)
+            return (
+                (q < 256)
+                & (k < uh * uw)
+                & (ky >= sy)
+                & (ky < sy + kh)
+                & (kx >= sx)
+                & (kx < sx + kw)
+            )
+
+        return create_block_mask(
+            mask_mod,
+            len(current),
+            None,
+            256,
+            uh * uw,
+            device=device,
+            BLOCK_SIZE=128,
+        )
+
+
 class _SpatialAttention(_WindowAttention):
     """Spatial attention with shared projections and two routing modes.
 
@@ -551,9 +648,16 @@ class _SpatialAttention(_WindowAttention):
         if context_na and (pos_bias != "rfb" or self.logit_scale is not None):
             raise ValueError("context_na requires RFB bias and dot-product attention")
         self.context_na = context_na
-        self.context_checkpoint = False
         self.na_training_fast = False
+        self.attn_type: Literal["masked", "hybrid"] = "masked"
+        self._flex_masks: dict[tuple[int, int, int], Any] = {}
         self.direct_fallback_reason: str | None = None
+
+    def _apply(self, fn: Any, recurse: bool = True) -> _SpatialAttention:
+        # BlockMasks are runtime geometry, not buffers or checkpoint contents.
+        # Device/dtype moves require fresh preparation on the destination.
+        self._flex_masks.clear()
+        return super()._apply(fn, recurse=recurse)
 
     @property
     def context_overlap(self) -> bool:
@@ -628,6 +732,7 @@ class _SpatialAttention(_WindowAttention):
         first: int,
         height: int,
         width: int,
+        key_bias: Tensor | None = None,
     ) -> Tensor:
         """Gather, mask and attend a query chunk; return unassembled tile outputs."""
         batch, heads, _, dim = query.shape
@@ -635,8 +740,15 @@ class _SpatialAttention(_WindowAttention):
         tile, chunk_size = 16, 4
         kh, kw = min(height, self.window), min(width, self.window)
         uh, uw = min(height, kh + tile - 1), min(width, kw + tile - 1)
-        qlocal = _na_coordinates(tile, tile, query.device)
-        klocal = _na_coordinates(uh, uw, query.device)
+        eager_inference = (
+            not self.training
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not torch.onnx.is_in_onnx_export()
+        )
+        coordinates = _inference_na_coordinates if eager_inference else _na_coordinates
+        qlocal = coordinates(tile, tile, query.device)
+        klocal = coordinates(uh, uw, query.device)
         tiles = [(y, z) for y in range(0, height, tile) for z in range(0, width, tile)]
         current = tiles[first : first + chunk_size]
         count = len(current)
@@ -658,20 +770,44 @@ class _SpatialAttention(_WindowAttention):
                 batch * count, heads, index.shape[1], dim
             )
 
-        origins = torch.tensor(current, device=query.device)
+        if eager_inference:
+            # Avoid two tiny host-to-device copies and their synchronizations
+            # per chunk. Tile ownership and integer coordinates are unchanged.
+            origins = (
+                coordinates(
+                    (height + tile - 1) // tile,
+                    (width + tile - 1) // tile,
+                    query.device,
+                )[first : first + count]
+                * tile
+            )
+        else:
+            origins = torch.tensor(current, device=query.device)
         qp = origins[:, None, :] + qlocal[None]
         qp = torch.stack(
             (qp[..., 0].clamp(max=height - 1), qp[..., 1].clamp(max=width - 1)), -1
         )
-        ko = origins - torch.tensor((kh // 2, kw // 2), device=query.device)
-        ko = torch.stack(
-            (ko[:, 0].clamp(0, height - uh), ko[:, 1].clamp(0, width - uw)), -1
-        )
+        if eager_inference:
+            ko = torch.stack(
+                (
+                    (origins[:, 0] - kh // 2).clamp(0, height - uh),
+                    (origins[:, 1] - kw // 2).clamp(0, width - uw),
+                ),
+                -1,
+            )
+        else:
+            ko = origins - torch.tensor((kh // 2, kw // 2), device=query.device)
+            ko = torch.stack(
+                (ko[:, 0].clamp(0, height - uh), ko[:, 1].clamp(0, width - uw)), -1
+            )
         kp = ko[:, None, :] + klocal[None]
         qi, ki = qp[..., 0] * width + qp[..., 1], kp[..., 0] * width + kp[..., 1]
         qt, kt, vt = gather(query, qi), gather(key, ki), gather(value, ki)
         bq, _ = self.factored_bias.factors((qp - ko[:, None]).reshape(-1, 2), dtype)
-        _, bk = self.factored_bias.factors(klocal, dtype)
+        if key_bias is None:
+            _, bk = self.factored_bias.factors(klocal, dtype)
+        else:
+            bk = key_bias
         rank = self.factored_bias.rank
         bq = bq.reshape(heads, count, tile * tile, rank).permute(1, 0, 2, 3)
         if fast:
@@ -699,6 +835,33 @@ class _SpatialAttention(_WindowAttention):
         # Positional factors extend Q/K only. Zero V lanes never contribute to
         # the returned channels; the supported training backend accepts Dv!=Dq.
         vt = vt.contiguous() if fast else F.pad(vt, (0, rank)).contiguous()
+        if (
+            fast
+            and self.attn_type == "hybrid"
+            and torch.compiler.is_compiling()
+            and not torch.onnx.is_in_onnx_export()
+        ):
+            block = self._flex_masks.get((height, width, first))
+            if block is None:
+                raise RuntimeError(
+                    "DUAL hybrid mask missing: call prepare_for_compile with the "
+                    "actual input shape and dtype after moving the model to CUDA"
+                )
+            # Content32 + RFB16 becomes64 by appending exact zeros. V stays32;
+            # learned RFB factors remain ordinary differentiable Q/K operands.
+            padded = 1 << (qt.shape[-1] - 1).bit_length()
+            attended = flex_attention(
+                F.pad(qt, (0, padded - qt.shape[-1])),
+                F.pad(kt, (0, padded - kt.shape[-1])),
+                vt,
+                block_mask=block,
+                scale=1.0,
+            )
+            return (
+                attended.reshape(count, batch, heads, tile, tile, dim)
+                .permute(1, 0, 2, 5, 3, 4)
+                .reshape(batch, count, channels, tile, tile)
+            )
         sy = (qp[..., 0] - kh // 2).clamp(0, height - kh)
         sx = (qp[..., 1] - kw // 2).clamp(0, width - kw)
         ky = ko[:, 0, None] + torch.arange(uh, device=query.device)[None]
@@ -749,13 +912,7 @@ class _SpatialAttention(_WindowAttention):
         )
 
     def _na_core(self, x: Tensor) -> Tensor:
-        """Exact per-query neighborhoods; optionally rematerialize chunk storage.
-
-        Keep image-wide QKV and output writes outside checkpoint regions. Only
-        gathered tensors, RFB intermediates and masks are regenerated; selective
-        checkpointing retains each fused attention output and log-sum-exp.
-        No neighborhood, positional coordinate frame or dtype is changed.
-        """
+        """Evaluate exact per-query neighborhoods in bounded spatial chunks."""
         if self.pos_bias != "rfb" or self.logit_scale is not None:
             raise ValueError("context_na requires RFB bias and dot-product attention")
         batch, channels, height, width = x.shape
@@ -767,23 +924,23 @@ class _SpatialAttention(_WindowAttention):
         output = x.new_empty((batch, channels, height, width), dtype=query.dtype)
         tile, chunk_size = 16, 4
         tiles = [(y, z) for y in range(0, height, tile) for z in range(0, width, tile)]
+        key_bias = None
+        if (
+            not self.training
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not torch.onnx.is_in_onnx_export()
+        ):
+            # Every chunk in this layer uses the same local key coordinates.
+            # Recompute once PER FORWARD so EMA/load updates cannot leave stale
+            # positional factors. Arithmetic, dtype and SDPA backend stay intact.
+            kh, kw = min(height, self.window), min(width, self.window)
+            uh, uw = min(height, kh + tile - 1), min(width, kw + tile - 1)
+            _, key_bias = self.factored_bias.factors(
+                _inference_na_coordinates(uh, uw, query.device), query.dtype
+            )
         for first in range(0, len(tiles), chunk_size):
-            if self.context_checkpoint and self.training and torch.is_grad_enabled():
-                attended = checkpoint(
-                    self._na_chunk,
-                    query,
-                    key,
-                    value,
-                    first,
-                    height,
-                    width,
-                    use_reentrant=False,
-                    context_fn=partial(
-                        create_selective_checkpoint_contexts, _na_checkpoint_policy
-                    ),
-                )
-            else:
-                attended = self._na_chunk(query, key, value, first, height, width)
+            attended = self._na_chunk(query, key, value, first, height, width, key_bias)
             for j, (y, z) in enumerate(tiles[first : first + chunk_size]):
                 th, tw = min(tile, height - y), min(tile, width - z)
                 output[:, :, y : y + th, z : z + tw] = attended[:, j, :, :th, :tw]
@@ -1087,14 +1244,11 @@ class RegionalChannelAttention(nn.Module):
     normalization counts real pixels, not padding; the caller adds the residual.
     """
 
-    def __init__(
-        self, channels: int = 96, heads: int = 3, *, core_checkpoint: bool = True
-    ) -> None:
+    def __init__(self, channels: int = 96, heads: int = 3) -> None:
         super().__init__()
         if channels < 1 or heads < 1 or channels % heads:
             raise ValueError("channels must be positive and divisible by heads")
         self.channels, self.heads = channels, heads
-        self.core_checkpoint = core_checkpoint
         self.norm = TokenNorm(channels, eps=1e-5)
         self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
         self.depthwise = nn.Conv2d(
@@ -1157,14 +1311,9 @@ class RegionalChannelAttention(nn.Module):
 
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """Blend four class outputs without an H*W*d*d matrix field."""
-        check = self.core_checkpoint and self.training and torch.is_grad_enabled()
         result = None
         for sy, sx in ((0, 0), (0, 16), (16, 0), (16, 16)):
-            out = (
-                checkpoint(self._class_core, q, k, v, sy, sx, use_reentrant=False)
-                if check
-                else self._class_core(q, k, v, sy, sx)
-            )
+            out = self._class_core(q, k, v, sy, sx)
             result = out if result is None else result + out
         return result
 
@@ -1178,14 +1327,13 @@ class RegionalChannelAttention(nn.Module):
 class DualContextLayer(nn.Module):
     """Spatial attention -> regional channel mixing -> convolutional FFN."""
 
-    def __init__(self, source: nn.Module, *, core_checkpoint: bool) -> None:
+    def __init__(self, source: nn.Module) -> None:
         super().__init__()
         self.norm1, self.attention = source.norm1, source.attention
         self.norm2, self.ffn = source.norm2, source.ffn
         self.dual = RegionalChannelAttention(
             self.attention.channels,
             self.attention.heads,
-            core_checkpoint=core_checkpoint,
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -1586,7 +1734,7 @@ class _Group(nn.Module):
         residual = x
         for layer in self.layers:
             if self.use_checkpoint and self.training and torch.is_grad_enabled():
-                x = checkpoint(layer, x, use_reentrant=False)
+                x = _checkpoint_layer(layer, x)
             else:
                 x = layer(x)
         return residual + self.conv(x)
@@ -1620,7 +1768,6 @@ class DUAL(nn.Module):
         context_na: bool | None = None,
         context_overlap: bool | None = None,
         g_window: int = 16,
-        context_checkpoint: bool = True,
         norm: Literal["token"] = "token",
         c_pos_bias: str = "rfb",
         rfb_rank: int = 16,
@@ -1628,17 +1775,27 @@ class DUAL(nn.Module):
         qk: QKMode = "dot",
         ffn: Literal["conv"] = "conv",
         use_checkpoint: bool = True,
-        dual_core_checkpoint: bool = False,
         g_attention_impl: Literal["sdpa", "direct"] = "sdpa",
         compile_g_attention_impl: Literal["sdpa", "direct"] = "direct",
+        attn_type: Literal["masked", "hybrid"] = "masked",
     ) -> None:
         super().__init__()
         _check_experts(dynamic_experts)
         if type(pixel_unshuffle) is not bool:
             raise ValueError("pixel_unshuffle must be a bool")
-        if type(context_checkpoint) is not bool:
-            raise ValueError("context_checkpoint must be a bool")
+        if type(use_checkpoint) is not bool:
+            raise ValueError("use_checkpoint must be a bool")
         context_na = _resolve_context_na(context_na, context_overlap, default=True)
+        if attn_type not in ("masked", "hybrid"):
+            raise ValueError("attn_type must be masked/hybrid")
+        if attn_type == "hybrid":
+            if not context_na:
+                raise ValueError("attn_type='hybrid' requires context_na=True")
+            if flex_attention is None:
+                raise ImportError(
+                    "DUAL hybrid attention requires PyTorch Flex Attention"
+                )
+        self.attn_type = attn_type
         if scale not in (1, 2, 4) or norm != "token":
             raise ValueError("DUAL requires scale 1/2/4 and token normalization")
         if not isinstance(embed_dim, int) or embed_dim < 32 or embed_dim % 32:
@@ -1687,9 +1844,9 @@ class DUAL(nn.Module):
         self.compile_g_attention_impl = compile_g_attention_impl
         self.scale = scale
         self.context_na = context_na
-        self.context_checkpoint = context_checkpoint
         self.compile_cache_key_tag = (
-            f"dual-family-attention-v3:context-checkpoint={context_checkpoint}"
+            f"dual-family-attention-v5:selective-checkpoint={use_checkpoint}"
+            f":attn-type={attn_type}"
         )
         self.unshuffle = pixel_unshuffle
         self.internal_scale = scale * (2 if pixel_unshuffle else 1)
@@ -1738,11 +1895,9 @@ class DUAL(nn.Module):
         self.xg = SecondOctaveTransfer(channels) if self.internal_scale >= 4 else None
         for group in self.groups:
             for index in (2, 5):
-                group.layers[index] = DualContextLayer(
-                    group.layers[index], core_checkpoint=dual_core_checkpoint
-                )
+                group.layers[index] = DualContextLayer(group.layers[index])
                 group.layers[index].attention.context_na = context_na
-                group.layers[index].attention.context_checkpoint = context_checkpoint
+                group.layers[index].attention.attn_type = attn_type
         for group, indices in zip(self.groups, selected, strict=True):
             group.layers = nn.ModuleList(group.layers[i] for i in indices)
         if self.unshuffle:
@@ -1802,7 +1957,7 @@ class DUAL(nn.Module):
         check = group.use_checkpoint and self.training and torch.is_grad_enabled()
         fine = h
         for index, layer in enumerate(group.layers):
-            h = checkpoint(layer, h, use_reentrant=False) if check else layer(h)
+            h = _checkpoint_layer(layer, h) if check else layer(h)
             if index == 1:
                 fine = h
         h = stem + group.conv(h)
@@ -1813,11 +1968,7 @@ class DUAL(nn.Module):
             F.pixel_unshuffle(coarse_input, 2) if self.unshuffle else coarse_input
         )
         for layer in group.layers[:2]:
-            coarse = (
-                checkpoint(layer, coarse, use_reentrant=False)
-                if check
-                else layer(coarse)
-            )
+            coarse = _checkpoint_layer(layer, coarse) if check else layer(coarse)
         # Retrieve packed trunk values using fine queries and coarse keys.
         height, width = h.shape[-2:]
         u = self.xr.norm_u(pad_even(h))
@@ -1860,8 +2011,9 @@ class DUAL(nn.Module):
         """Select training execution paths without changing model mathematics.
 
         Every preset and scale shares these capability checks: no width, depth
-        or input-packing special case is needed. No caches need priming. Repeated
-        calls reset routing, and eval/export copies stay on portable SDPA.
+        or preset-specific restriction is needed. Hybrid masks are shared across
+        equal context windows and primed for the actual trunk size, including
+        PU2 padding. Repeated calls replace caches; eval/export keep portable SDPA.
         Per-call device/dtype/geometry checks still govern actual execution.
         """
         training = self.training and not self.deployed
@@ -1871,8 +2023,31 @@ class DUAL(nn.Module):
             and self.compile_g_attention_impl == "direct"
             and input_dtype in (torch.bfloat16, torch.float16)
         )
+        flex_shape = None
+        if (
+            bf16_context
+            and self.attn_type == "hybrid"
+            and self.mean.device.type == "cuda"
+            and not torch.are_deterministic_algorithms_enabled()
+        ):
+            if (
+                input_shape is None
+                or len(input_shape) != 4
+                or any(type(d) is not int or d < 1 for d in input_shape)
+                or input_shape[1] != 3
+            ):
+                raise ValueError(
+                    "Hybrid compilation requires a fixed positive BCHW RGB input_shape"
+                )
+            height, width = input_shape[-2:]
+            if self.unshuffle:
+                height, width = ((height + 3) // 4) * 2, ((width + 3) // 4) * 2
+            flex_shape = height, width
+        shared_masks: dict[tuple[int, int], Any] = {}
         for layer in self.modules():
             if isinstance(layer, _SpatialAttention):
+                masks: dict[tuple[int, int, int], Any] = {}
+                layer._flex_masks = masks  # noqa: SLF001 - Model owns runtime caches.
                 layer.na_training_fast = bool(
                     bf16_context
                     and layer.context_na
@@ -1880,6 +2055,17 @@ class DUAL(nn.Module):
                     and layer.window in (32, 64)
                     and layer.factored_bias.rank == 16
                 )
+                if flex_shape is not None and layer.na_training_fast:
+                    height, width = flex_shape
+                    if height > layer.window or width > layer.window:
+                        count = ((height + 15) // 16) * ((width + 15) // 16)
+                        for first in range(0, count, 4):
+                            key = layer.window, first
+                            if key not in shared_masks:
+                                shared_masks[key] = _na_block_mask(
+                                    height, width, layer.window, first, self.mean.device
+                                )
+                            masks[(height, width, first)] = shared_masks[key]
                 layer.g_attention_impl = (
                     "direct"
                     if direct_local
@@ -1897,6 +2083,7 @@ class DUAL(nn.Module):
             if isinstance(layer, _SpatialAttention):
                 layer.g_attention_impl = "sdpa"
                 layer.na_training_fast = False
+                layer._flex_masks.clear()  # noqa: SLF001 - Drop export-only runtime state.
         if self.deployed:
             return
         for name in self.reparameterized_names:
@@ -3086,8 +3273,6 @@ _XS_INDICES = _LIGHT_INDICES
 def dual_light(
     scale: int = 4,
     use_checkpoint: bool = True,
-    *,
-    context_checkpoint: bool = True,
     **kwargs: Any,
 ) -> DUAL:
     """Light: C128, four heads, 16 layers, PU2; native output scales 1/2/4."""
@@ -3098,7 +3283,6 @@ def dual_light(
         layer_indices=_LIGHT_INDICES,
         pixel_unshuffle=True,
         use_checkpoint=use_checkpoint,
-        context_checkpoint=context_checkpoint,
         **kwargs,
     )
 
