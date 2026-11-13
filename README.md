@@ -144,19 +144,13 @@ The local and retrieval cases differ in kind. Local borders move by half a windo
 flowchart TB
   subgraph PERQUERY["Per-query support (NA)"]
     direction TB
-    PQ["Adjacent queries a and b<br/>anywhere inside the image"]
-    PQ --> PSA["a reads S(a),<br/>centred on a"]
-    PQ --> PSB["b reads S(b):<br/>S(a) moved with the query"]
-    PSA --> PR["All but one row or column<br/>of donors shared"]
-    PSB --> PR
+    PQ["Adjacent queries a and b<br/>anywhere inside the image"] --> PS["a reads S(a), centred on a<br/>b reads S(b): S(a) moved with the query"]
+    PS --> PR["All but one row or column<br/>of donors shared"]
   end
   subgraph FIXED["Fixed partition"]
     direction TB
-    FQ["Adjacent queries a and b<br/>on opposite sides of a border"]
-    FQ --> FSA["a reads block 1 only"]
-    FQ --> FSB["b reads block 2 only"]
-    FSA --> FR["No shared donors:<br/>the support jumps at the border"]
-    FSB --> FR
+    FQ["Adjacent queries a and b<br/>on opposite sides of a border"] --> FS["a reads block 1 only<br/>b reads block 2 only"]
+    FS --> FR["No shared donors:<br/>the support jumps at the border"]
   end
 ```
 
