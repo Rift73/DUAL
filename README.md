@@ -1,6 +1,6 @@
 # DUAL: Neighbourhood Attention and Dynamic Kernel Mixing for Image Restoration
 
-Rift73 | Technical report | 1 November 2026
+Rift73 | Technical report | 14 November 2026
 
 [Typeset paper (PDF)](DUAL.pdf) · [Architecture](dual_arch.py) · [License](LICENSE)
 
