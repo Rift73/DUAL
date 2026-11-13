@@ -8,7 +8,7 @@ Diagrams are embedded below; the PDF contains the typeset figures.
 
 ### Abstract
 
-DUAL is a single-image restoration backbone that combines local window attention, Neighbourhood Attention (NA), regional channel mixing, cross-scale self-exemplar retrieval, and image-conditioned convolution. Local layers use anchored windows with tabulated relative position bias. Context layers use NA: each query pixel attends to its own 32 x 32 or 64 x 64 in-bounds neighbourhood, with stationary Fourier bias represented through query/key factor concatenation. A separate regional operator blends channel interactions across four shifted grids. Cross-scale retrieval reuses a shallow encoder on a filtered coarse image and transfers packed values into the trunk and reconstruction stream. At each group exit, a centered router mixes residual kernels into a reparameterized static base before convolution. Six presets support 1x, 2x, and 4x restoration. This report details their architecture, scale-dependent reconstruction, initialization, and training and deployment behavior.
+DUAL is a single-image restoration backbone that combines local window attention, Neighbourhood Attention (NA), regional channel mixing, cross-scale self-exemplar retrieval, and image-conditioned convolution. Local layers use per-query 16 x 16 neighbourhoods with tabulated relative position bias. Context layers use NA: each query pixel attends to its own 32 x 32 or 64 x 64 in-bounds neighbourhood, with stationary Fourier bias represented through query/key factor concatenation. A separate regional operator blends channel interactions across four shifted grids. Cross-scale retrieval reuses a shallow encoder on a filtered coarse image and transfers packed values into the trunk and reconstruction stream. At each group exit, a centered router mixes residual kernels into a reparameterized static base before convolution. Six presets support 1x, 2x, and 4x restoration. This report details their architecture, scale-dependent reconstruction, initialization, and training and deployment behavior.
 
 ```mermaid
 flowchart TB
@@ -69,18 +69,18 @@ The raw DUAL constructor defaults to C96 with four full groups. It is not the Li
 
 ## 3  Local window attention and Neighbourhood Attention
 
-Neighbourhood Attention (NA) is query-centred spatial attention [3]. A local-window layer assigns several queries to a shared window; an NA layer instead selects an in-bounds donor rectangle for each query pixel. Adjacent queries can therefore retrieve values across a local-window boundary without averaging multiple output predictions. DUAL combines this support rule with even-sized 32 x 32 and 64 x 64 neighbourhoods and learned relative Fourier bias; its implementation does not require the NATTEN library.
+Neighbourhood Attention (NA) is query-centred spatial attention [3]. A local-window layer assigns several queries to a shared window; an NA layer instead selects an in-bounds donor rectangle for each query pixel. Adjacent queries can therefore retrieve values across a local-window boundary without averaging multiple output predictions. DUAL applies this support rule in context layers with even-sized 32 x 32 and 64 x 64 neighbourhoods and learned relative Fourier bias, and in local layers with 16 x 16 neighbourhoods and their tabulated relative position bias; its implementation does not require the NATTEN library.
 
-Each spatial sublayer receives channel-normalized features. Its attention output is multiplied by a sigmoid gate computed with a depthwise 3 x 3 and pointwise convolution, then projected and added residually. Local G16 layers alternate unshifted and half-window-offset ownership. At a boundary, window origins are clamped inward; each output pixel still has one designated owner. Short axes use their available extent.
+Each spatial sublayer receives channel-normalized features. Its attention output is multiplied by a sigmoid gate computed with a depthwise 3 x 3 and pointwise convolution, then projected and added residually. By default (local_na=True), each query in a local G16 layer attends to its own 16 x 16 in-bounds neighbourhood, and the layer's bias is read by query-minus-key offset as in the window table; the alternating shift then has no effect. With local_na=False, and on maps of at most 16 positions per axis, local G16 layers instead alternate unshifted and half-window-offset ownership. At a boundary, window origins are clamped inward; each output pixel still has one designated owner. Short axes use their available extent.
 
 ```mermaid
 flowchart LR
-  subgraph LOCAL["Local window attention"]
+  subgraph LOCAL["Local window attention (local_na=False)"]
     LQ["One pixel query"] --> LW["Owned 16x16 window<br/>alternating ownership offset"]
     LW --> LO["Mix spatial values"]
   end
   subgraph NEIGHBOR["Neighbourhood Attention (NA)"]
-    NQ["One pixel query"] --> NW["32x32 or 64x64 support<br/>moves with each query"]
+    NQ["One pixel query"] --> NW["16x16 local or 32x32 / 64x64 context support<br/>moves with each query"]
     NW --> NO["Mix spatial values"]
   end
   subgraph CHANNEL["Regional channel attention"]
@@ -90,7 +90,7 @@ flowchart LR
   end
 ```
 
-*Figure 2. Three different operations. Local window attention and Neighbourhood Attention (NA) mix spatial locations; regional attention instead builds channel-correlation matrices within regions. These are structural schematics, not measured attention maps.*
+*Figure 2. Three different operations. Local window attention and Neighbourhood Attention (NA) mix spatial locations; regional attention instead builds channel-correlation matrices within regions. By default local G16 layers use NA; owned windows are what local_na=False gives. These are structural schematics, not measured attention maps.*
 
 A<sub>p</sub> = Σ<sub>j ∈ S(p)</sub> softmax<sub>j</sub>(q<sub>p</sub>k<sub>j</sub><sup>T</sup>/√32 + B(p,j)) v<sub>j</sub>.   (2)
 
@@ -108,11 +108,11 @@ flowchart TB
 
 *Figure 3. Neighbourhood Attention (NA). Each query selects an in-bounds support that follows its position and shifts inward at borders. Adjacent supports may coincide near an edge. Execution tiles share gathered storage, not output predictions.*
 
-For context size M, define kH=min(H,M), kW=min(W,M), aY(p)=clamp(pY-floor(kH/2),0,H-kH), and the analogous aX. S(p) is the rectangle [aY,aY+kH) x [aX,aX+kW). Near an edge the rectangle shifts inward rather than filling with invalid padding. If both axes fit inside M, the implementation uses a single full-image window. Otherwise, 16 x 16 query tiles are processed in chunks of up to four. A shared key union is masked separately for every query to recover S(p) exactly. This grouping is an execution detail, not four heads or a change to the neighbourhood size.
+For context size M, define kH=min(H,M), kW=min(W,M), aY(p)=clamp(pY-floor(kH/2),0,H-kH), and the analogous aX. S(p) is the rectangle [aY,aY+kH) x [aX,aX+kW). Near an edge the rectangle shifts inward rather than filling with invalid padding. If both axes fit inside M, the implementation uses a single full-image window. Otherwise, 16 x 16 query tiles are processed in chunks of up to four. A shared key union is masked separately for every query to recover S(p) exactly. This grouping is an execution detail, not four heads or a change to the neighbourhood size. Local NA follows the same rule with M=16 and RPB in place of Fourier bias; if both axes fit inside 16, the owned-window path is used, and otherwise 8 x 8 query tiles share a 23 x 23 key union under a per-query mask.
 
 ### 3.1  What NA changes
 
-The attention weights depend on query/key content and relative position; NA is not a fixed smoothing filter. Overlap occurs between donor neighbourhoods, not between separately predicted outputs. The per-query support removes a fixed shared-window partition from the context operator, but does not guarantee a seam-free model: local windows, cross-scale blocks, convolution borders, and PU2 retain their own boundary behavior. NA complements these components rather than replacing them.
+The attention weights depend on query/key content and relative position; NA is not a fixed smoothing filter. Overlap occurs between donor neighbourhoods, not between separately predicted outputs. With the default switches, per-query supports remove fixed shared-window partitions from the context, local and cross-scale operators, but this does not guarantee a seam-free model: convolution borders, PU2, the regional mixer's blended windows, and per-image routing retain their own boundary behavior. With local_na=False or retrieval_na=False, the fixed local windows or cross-scale blocks return. NA complements these components rather than replacing them.
 
 NA specifies which pixels can interact. SDPA and FlexAttention specify how that attention is executed. The optional Flex path preserves the same per-query support and learned Fourier factors; enabling it is not an architectural switch from window attention to NA. Backend changes can nevertheless alter floating-point rounding, latency, and memory use.
 
@@ -165,7 +165,7 @@ flowchart TB
 
 *Figure 4. Origins and destinations of cross-scale features. CrossScaleRetrieval provides trunk and first-stage readouts. SecondOctaveTransfer reuses the query/key representations with its own temperature and new values from the first tail stage. The final image skip is omitted for clarity.*
 
-The fine path records a prefix after these two layers and continues through the second group. A query projection receives normalized prefix and current features; keys are projected from normalized coarse features. Queries are grouped into blocks of up to 96 x 96 trunk positions with corresponding half-resolution key blocks. Equal-shaped blocks are batched. Retrieval is blockwise, not unrestricted image-wide attention.
+The fine path records a prefix after these two layers and continues through the second group. A query projection receives normalized prefix and current features; keys are projected from normalized coarse features. By default (retrieval_na=True), each fine query attends to its own 48 x 48 coarse-key neighbourhood centred on its coarse cell (floor(pY/2), floor(pX/2)), with the NA origin rule of Section 3 shifting it inward at borders; there is no position bias, and N<sub>k</sub> in (5) is the neighbourhood's key count. With retrieval_na=False, queries are instead grouped into blocks of up to 96 x 96 trunk positions with corresponding half-resolution key blocks, and equal-shaped blocks are batched. A coarse grid of at most 48 positions per axis is a single block under either setting, so 192-pixel PU2 crops are unchanged. SecondOctaveTransfer follows the same choice through the shared query/key representations. Retrieval is neighbourhood-limited, not unrestricted image-wide attention.
 
 P<sub>h</sub> = softmax[τ<sub>h</sub> λ(N<sub>k</sub>) Q<sub>h</sub>K<sub>h</sub><sup>T</sup>],
 λ(N<sub>k</sub>) = ln N<sub>k</sub> / (ln 1024 · √32),  0.1 ≤ τ<sub>h</sub> ≤ 10.   (5)
@@ -237,14 +237,16 @@ prepare_for_export() folds static factors in FP64 on an eval copy and retains in
 | Option | Default | Role |
 |---|---|---|
 | context_na | True | Neighbourhood Attention in context layers |
+| local_na | True | Neighbourhood Attention in local G16 layers |
+| retrieval_na | True | Neighbourhood Attention for cross-scale retrieval |
 | use_checkpoint | True | Selective whole-layer activation checkpointing |
 | attn_type | masked | SDPA for NA; hybrid opts into eligible compiled Flex calls |
 | g_attention_impl | sdpa | Eager local attention path |
-| compile_g_attention_impl | direct | Eligible local path after preparation |
+| compile_g_attention_impl | direct | Eligible fixed-window local path after preparation (local_na=False only) |
 
 Table 3. Effective execution defaults for all presets and scales. Activation checkpointing is distinct from saving training state. NA remains enabled under both attention backend choices.
 
-prepare_for_compile(input_shape, input_dtype) configures an undeployed training model using capability checks shared by every preset and output scale. With FP16/BF16 inputs, eligible full G16/G32 anchored dot-product layers can use the bundled dense-relative-bias Triton kernel. Device, dtype, geometry, and mask checks still apply at execution. Unsupported local geometry routes to SDPA with a warning; missing direct-kernel dependencies are reported rather than silently ignored. Setting compile_g_attention_impl to sdpa keeps local attention on SDPA.
+prepare_for_compile(input_shape, input_dtype) configures an undeployed training model using capability checks shared by every preset and output scale. With FP16/BF16 inputs, eligible full G16/G32 anchored dot-product layers can use the bundled dense-relative-bias Triton kernel; it implements fixed windows, so it is selected only for layers with local_na=False, and local NA uses SDPA. Device, dtype, geometry, and mask checks still apply at execution. Unsupported local geometry routes to SDPA with a warning; missing direct-kernel dependencies are reported rather than silently ignored. Setting compile_g_attention_impl to sdpa keeps local attention on SDPA.
 
 For eligible CUDA BF16 context training with deterministic algorithms disabled, images are folded into the head dimension so one tile mask is shared across images. With attn_type=masked, this path uses SDPA and prefers cuDNN attention, then efficient attention or the math implementation according to backend support. The 32 content channels and 16 Fourier lanes give Q/K width 48, while V stays at width 32. The standard layout instead zero-pads V and slices the result. These layouts preserve the same neighbourhoods and relative coordinates.
 
@@ -264,7 +266,7 @@ use_checkpoint is the only activation-checkpoint option: False disables explicit
 
 Evaluation NA uses SDPA, not the compiled-training Flex path, and disables activation checkpointing. Eager inference without gradients reuses bounded integer-coordinate caches and computes shared key-side Fourier factors once per layer forward; learned factors are not cached across weight updates. SDPA is a dispatch API, not a guarantee that FlashAttention is available or selected. Mask, dtype, shape, platform, and backend support govern the implementation.
 
-The architecture file bundles its optional direct local-attention kernels and can import without traiNNer. Export preparation resets spatial routing to SDPA, disables the BF16 training layout, clears Flex masks, and folds static convolution factors. NA support remains unchanged. This prepares a model copy; it does not itself generate ONNX, build a TensorRT engine, or package a TensorRT plugin. TensorRT fusion and any external NA plugin are separate deployment choices, not enabled by attn_type=hybrid.
+The architecture file bundles its optional direct local-attention kernels and can import without traiNNer. Export preparation resets spatial routing to SDPA, disables the BF16 training layout, clears Flex masks, and folds static convolution factors. NA support remains unchanged: context_na, local_na and retrieval_na stay as configured, and their neighbourhoods are expressed as index gathers and masked SDPA. This prepares a model copy; it does not itself generate ONNX, build a TensorRT engine, or package a TensorRT plugin. TensorRT fusion and any external NA plugin are separate deployment choices, not enabled by attn_type=hybrid.
 
 Call model.eval(), make a separate deep copy, then call prepare_for_export() on that copy. The DUAL method returns None. Keep the unfolded model and checkpoint for training or resumption.
 
@@ -272,13 +274,13 @@ Call model.eval(), make a separate deep copy, then call prepare_for_export() on 
 
 ### 8.1  Checkpoints and integration
 
-Select the factory, requested scale, and structural options before loading an unfolded state dictionary. Load strictly when the architecture matches. Settings such as context_na and window sizes are not fully described by parameter shapes, so store the architecture configuration alongside the weights.
+Select the factory, requested scale, and structural options before loading an unfolded state dictionary. Load strictly when the architecture matches. Settings such as context_na, local_na, retrieval_na and window sizes are not fully described by parameter shapes, so store the architecture configuration alongside the weights. Neither local_na nor retrieval_na changes parameters or state-dictionary keys, so existing checkpoints load unchanged, and setting both to False reproduces the earlier behavior.
 
 For traiNNer integration, place the single file in traiNNer/archs and select its registered factory in network_g. Avoid simultaneously importing an older module that registers the same names. Keep precision, color convention, output clipping, padding, and tiling choices explicit in inference tooling. The architecture itself does not clamp its RGB output to a display range.
 
 ### 8.2  Finite-image and numerical limits
 
-Neighbourhood Attention is bounded; it is not unrestricted global attention. PU2 changes phase handling and the relation between trunk pixels and input pixels. Local-window ownership, cross-scale block boundaries, convolution padding, and image-wide routing prevent a blanket claim of exact translation equivariance. Independently tiled inference changes both available donors and routing statistics, so it is not generally identical to whole-image inference. Parameter-compatible changes to support can also change texture behavior.
+Neighbourhood Attention is bounded; it is not unrestricted global attention. PU2 changes phase handling and the relation between trunk pixels and input pixels. Convolution padding, image-wide routing, and, with the switches off, local-window ownership and cross-scale block boundaries prevent a blanket claim of exact translation equivariance. Independently tiled inference changes both available donors and routing statistics, so it is not generally identical to whole-image inference. Parameter-compatible changes to support can also change texture behavior.
 
 Kernel composition, factor concatenation, and layout changes preserve the stated algebra, but floating-point accumulation and casts can affect outputs and gradients. This report describes the architecture; it does not present quality or runtime benchmarks.
 
@@ -287,7 +289,7 @@ Kernel composition, factor concatenation, and layout changes preserve the stated
 | Notation | Meaning |
 |---|---|
 | NA | Neighbourhood Attention: a content-weighted donor neighbourhood selected per query pixel. |
-| G16 / C32 / C64 | Local window 16 / NA context support 32 or 64. |
+| G16 / C32 / C64 | Local layer with 16 x 16 NA support (owned 16 x 16 window with local_na=False) / NA context support 32 or 64. |
 | SDPA / Flex | Execution backends; neither changes NA's donor-support definition. |
 | RFB / RPB | Relative Fourier bias / tabulated relative position bias. |
 | PU2 / F64 | PixelUnshuffle by 2 / reconstruction width of 64 channels. |
