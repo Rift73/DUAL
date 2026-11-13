@@ -1,8 +1,8 @@
 """DUAL: dual-context super-resolution with cross-scale feature retrieval.
 
 RGB input (B,3,H,W) produces (B,3,scale*H,scale*W), with native scales 1/2/4.
-The model combines local spatial attention, neighborhood context attention,
-regional channel attention and a shared fine/coarse feature-retrieval path.
+The model combines neighborhood attention in its local layers, context layers
+and cross-scale retrieval with regional channel attention and dynamic kernels.
 
 Preset       Width  Group depths         Heads  Input packing
 Light          128  (4,3,3,6)                 4  PixelUnshuffle2
@@ -16,12 +16,19 @@ All presets use 32 channels per attention head and a 64-channel reconstruction
 stream. The configurable DUAL constructor defaults to C96 with four full groups;
 use the registered factories for the preset geometries above.
 
-Spatial/context attention:
-    Local layers default to per-query 16x16 in-bounds neighborhoods with dense
-    relative position bias; local_na=False restores anchored, alternately
-    shifted G16 windows. Context layers
-    default to per-query 32x32/64x64 in-bounds neighborhoods with relative Fourier
-    bias. A separate regional channel mixer follows each context attention.
+Spatial attention (one support rule in three places):
+    Each query attends its own in-bounds K x K neighborhood with origin
+    clamp(center - K//2, 0, length - K) and K = min(window, length) per axis.
+    local_na: G16 layers, 16x16 around the query, dense relative position bias
+    read by query-minus-key offset; the alternating shift has no effect.
+    context_na: C32/C64 layers, 32x32/64x64 around the query, relative Fourier
+    bias. retrieval_na: each fine query reads 48x48 coarse keys centered on its
+    coarse cell, no position bias; SecondOctaveTransfer shares the packed Q/K.
+    All three default True. False restores fixed partitions: owned, alternately
+    shifted G16 windows; anchored context windows; 96x96 trunk-position blocks
+    with half-resolution key blocks. Maps within one window (local 16, context
+    32/64, coarse 48 per axis) take the single-window path under either setting.
+    A separate regional channel mixer follows each context attention.
     Neighborhood attention does not blend overlapping output predictions.
 
 Convolution and reconstruction:
@@ -33,9 +40,9 @@ Convolution and reconstruction:
     requested scale; reconstruction heads and checkpoints are scale-specific.
 
 Execution:
-    Eager attention uses PyTorch SDPA. prepare_for_compile() selects the bundled
-    direct fixed-window local backend (only with local_na=False) and a
-    mask-sharing BF16 context layout.
+    Eager attention uses PyTorch SDPA; local and retrieval NA always use masked
+    SDPA. prepare_for_compile() selects the bundled direct fixed-window local
+    backend (only with local_na=False) and a mask-sharing BF16 context layout.
     The same execution policy applies to every preset and output scale; runtime
     device, dtype and attention geometry determine which backend can execute.
     use_checkpoint=True enables selective whole-layer checkpointing in training:
@@ -49,16 +56,12 @@ Execution:
     prepare_for_export() requires an eval copy and folds static EDBB factors
     in-place. Dynamic routing remains input-dependent; never fold for training.
 
-Configuration such as context windows and NA routing is not stored in weights.
-context_na=False selects anchored window context; context_overlap is only a
+Configuration such as context windows and NA switches is not stored in weights;
+the switches change no parameters or state-dict keys. context_overlap is only a
 deprecated alias for context_na, not an overlap-add implementation.
-local_na (default True) runs the G16 local layers as per-query 16x16
-neighborhoods with their dense RPB; shifting has no effect there, and maps of at
-most 16 positions per axis keep the window path. retrieval_na (default True)
-lets each fine query attend its own 48x48 coarse-key neighborhood around its
-coarse cell; coarse grids of at most 48 per axis keep the single-block path.
-Both start each neighborhood at clamp(center - K//2, 0, length - K) and batch
-8x8 query tiles with a mask; False restores windows and 96px blocks.
+Execution tiles: context NA gathers 16x16 query tiles, four per call; local and
+retrieval NA gather 8x8 query tiles under an element cap. A per-query mask over
+each tile's shared key union recovers the exact neighborhood.
 
 Dependencies are PyTorch, optional Triton/direct-attention APIs, and an optional
 traiNNer registry. No other architecture or local kernel file is required.
@@ -388,7 +391,7 @@ class SignedFactoredBias(nn.Module):
         return query.to(dtype), key.to(dtype)
 
 
-# Spatial attention: anchored windows and sliding context neighborhoods.
+# Spatial attention: per-query local/context neighborhoods and anchored windows.
 
 
 class _WindowAttention(nn.Module):
@@ -715,10 +718,11 @@ def na_geometry(
 class _SpatialAttention(_WindowAttention):
     """Spatial attention with shared projections and two routing modes.
 
-    Local layers use anchored windows. Context layers may instead gather one
-    in-bounds neighborhood per query, shifting it inward at image borders.
-    Queries are processed in 16x16 tiles, four tiles per chunk; a per-query
-    mask enforces the neighborhood even though chunk storage shares donors.
+    With local_na or context_na set (DUAL's default), maps larger than one
+    window on either axis gather one in-bounds neighborhood per query, shifting
+    it inward at image borders; otherwise anchored windows are used. Context NA
+    processes 16x16 query tiles, four per chunk; local NA uses 8x8 tiles. A
+    per-query mask enforces the neighborhood even though tiles share donors.
     """
 
     def __init__(
@@ -1148,7 +1152,7 @@ class _SpatialAttention(_WindowAttention):
         return super().pre_gate_core(x)
 
 
-# Cross-scale retrieval: block packing, attention and reconstruction transfers.
+# Cross-scale retrieval: neighborhood or block packing, attention and transfers.
 
 
 def axis_spans(
@@ -1265,10 +1269,12 @@ def unpack_grandchildren(x: Tensor) -> Tensor:
 
 
 def pack_qk(q: Tensor, k: Tensor, *, na: bool = False) -> tuple:
-    """Pair 96px query blocks with half-resolution keys, batching equal shapes.
+    """Pack fine queries with half-resolution keys for attend_packed.
 
-    With na=True and a coarse grid above 48 on either axis, each fine query
-    instead keeps its own 48x48 coarse-key neighborhood (8x8 query tiles).
+    With na=True (DUAL's retrieval_na default) and a coarse grid above 48 on
+    either axis, each fine query keeps its own 48x48 coarse-key neighborhood
+    (8x8 query tiles). Otherwise 96x96 trunk-position query blocks pair with
+    their half-resolution key blocks, batching equal shapes.
     """
     if na and max(k.shape[-2:]) > 48:
         batch, heads = q.shape[0], q.shape[1] // 32
@@ -1367,8 +1373,10 @@ class CrossScaleRetrieval(nn.Module):
     The coarse branch uses a fixed separable downsampler and shares the stem
     and first two local layers with the fine branch. Queries combine fine-prefix
     and group-two features; keys use the coarse branch, while values carry
-    group-two features packed into four spatial slots. Separate zero-initialized
-    readouts inject the result into the trunk and the 2x reconstruction stream.
+    group-two features packed into four spatial slots. By default each fine
+    query reads a 48x48 coarse-key neighborhood (see pack_qk). Separate
+    zero-initialized readouts inject the result into the trunk and the 2x
+    reconstruction stream.
     """
 
     def __init__(self, channels: int = 96, *, include_hr: bool = True) -> None:
@@ -1977,7 +1985,7 @@ class DUAL(nn.Module):
 
     context_na, local_na and retrieval_na (all default True) select per-query
     neighborhoods for the context layers, the G-window local layers and the
-    cross-scale retrieval respectively; False keeps windows or 96px blocks.
+    cross-scale retrieval respectively; False keeps windows or 96x96 blocks.
     local_na requires qk='dot'. None of them changes parameters or keys.
     """
 
@@ -2339,7 +2347,7 @@ class DUAL(nn.Module):
 
 
 # Optional fused local-attention backend.
-# This bundled dense-RPB kernel serves G16/G32 attention, not context NA.
+# This bundled dense-RPB kernel serves fixed G16/G32 windows, not NA layers.
 # Missing optional APIs are reported when direct execution is requested; SDPA
 # remains available without Triton.
 _DIRECT_ATTENTION_ERROR: str | None = None
