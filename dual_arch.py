@@ -40,12 +40,10 @@ Convolution and reconstruction:
     requested scale; reconstruction heads and checkpoints are scale-specific.
 
 Execution:
-    Eager, eval and export attention use PyTorch SDPA (local, context and
-    retrieval NA as masked SDPA over gathered key unions). For low-precision
-    training, prepare_for_compile() selects bundled Triton kernels under one
-    switch (compile_g_attention_impl='direct', the default): the fixed-window
-    dense-RPB kernel and one neighborhood-attention kernel family that reads
-    Q/K/V from the full maps, used three ways:
+    Training calls on CUDA in BF16 or FP16, eager or compiled, run bundled
+    Triton kernels wherever Triton is available and the geometry fits: the
+    fixed-window dense-RPB kernel and one neighborhood-attention kernel family
+    that reads Q/K/V from the full maps, used three ways:
       local NA   - dense RPB table; training, CUDA, BF16/FP16, both map sides
                    at least one window;
       context NA - Fourier bias factors as extra Q/K columns; masked RFB layers,
@@ -53,22 +51,18 @@ Execution:
       retrieval  - fine queries over half-resolution keys (stride 2), shared
                    with the second-octave transfer; training with gradients,
                    CUDA, BF16/FP16, when the coarse key grid exceeds 48.
-    Everything else keeps the SDPA paths. Constructing with
-    g_attention_impl='direct' selects the direct kernels for training in eager
-    mode as well (the existing meaning for the fixed-window kernel); the
-    default 'sdpa' keeps eager on the reference paths. Inductor keeps its own
-    options in every compile mode. compile_cache_key_tag
-    ('dual-family-attention-v8...') versions this compiler-facing contract.
+    Everything else (evaluation, export, CPU, FP32) uses PyTorch SDPA (local,
+    context and retrieval NA as masked SDPA over gathered key unions). A missing
+    Triton is reported once per layer. Inductor keeps its own options in every
+    compile mode. compile_cache_key_tag ('dual-family-attention-v10...')
+    versions this compiler-facing contract.
     The same execution policy applies to every preset and output scale; runtime
     device, dtype and attention geometry determine which backend can execute.
     use_checkpoint=True enables selective whole-layer checkpointing in training:
     save expensive attention results and recompute surrounding intermediates.
     Set it to False to disable explicit checkpointing. Eval/export never use it.
-    attn_type="masked" keeps the paths above; opt-in "hybrid" uses Flex for
-    compiled BF16 context NA only. Unmasked attention, eager/eval and export
-    keep SDPA.
-    Hybrid requires PyTorch Flex/Triton and prepare_for_compile(input_shape,
-    input_dtype) after moving the model to CUDA; traiNNer calls this hook.
+    traiNNer calls prepare_for_compile(input_shape, input_dtype) after moving
+    the model to CUDA.
     These execution options do not promise bitwise equivalence across backends.
     prepare_for_export() requires an eval copy and folds static EDBB factors
     in-place. Dynamic routing remains input-dependent; never fold for training.
@@ -109,13 +103,6 @@ from torch.utils.checkpoint import (
     create_selective_checkpoint_contexts,
 )
 
-try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-except ImportError:
-    create_block_mask = flex_attention = None
-
-_FLEX_ATTENTION_OP = getattr(torch.ops.higher_order, "flex_attention", None)
-
 __all__ = [  # noqa: RUF022 - Keep public presets in family order.
     "DUAL",
     "dual_light",
@@ -141,7 +128,7 @@ def _selective_checkpoint_policy(
         torch.ops.aten._scaled_dot_product_cudnn_attention.default,  # noqa: SLF001
         torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,  # noqa: SLF001
     )
-    if op in saved or (_FLEX_ATTENTION_OP is not None and op is _FLEX_ATTENTION_OP):
+    if op in saved:
         return CheckpointPolicy.MUST_SAVE
     if _HAS_DIRECT_ATTENTION and op in (
         torch.ops.dual_standalone.dense_rpb_attention.default,
@@ -592,52 +579,6 @@ def _inference_na_coordinates(height: int, width: int, device: torch.device) -> 
         return _na_coordinates(height, width, device)
 
 
-def _na_block_mask(
-    height: int, width: int, window: int, first: int, device: torch.device
-) -> Any:
-    """Build one immutable four-tile Flex mask outside the compiled graph.
-
-    Rows use clamped query coordinates and inward-shifted donor origins, exactly
-    like _na_chunk. Image batches share this geometry through the head axis.
-    The callback captures integer geometry only, never learned Fourier factors.
-    """
-    if create_block_mask is None:
-        raise ImportError("DUAL hybrid attention requires PyTorch Flex Attention")
-    kh, kw = min(height, window), min(width, window)
-    uh, uw = min(height, kh + 15), min(width, kw + 15)
-    tiles = [(y, x) for y in range(0, height, 16) for x in range(0, width, 16)]
-    current = tiles[first : first + 4]
-    with torch.inference_mode(False), torch.no_grad():
-        origins = torch.tensor(current, device=device, dtype=torch.int64)
-
-        def mask_mod(b, h, q, k):
-            oy, ox = origins[b, 0], origins[b, 1]
-            qy = (oy + q // 16).clamp(max=height - 1)
-            qx = (ox + q % 16).clamp(max=width - 1)
-            ky = (oy - kh // 2).clamp(0, height - uh) + k // uw
-            kx = (ox - kw // 2).clamp(0, width - uw) + k % uw
-            sy = (qy - kh // 2).clamp(0, height - kh)
-            sx = (qx - kw // 2).clamp(0, width - kw)
-            return (
-                (q < 256)
-                & (k < uh * uw)
-                & (ky >= sy)
-                & (ky < sy + kh)
-                & (kx >= sx)
-                & (kx < sx + kw)
-            )
-
-        return create_block_mask(
-            mask_mod,
-            len(current),
-            None,
-            256,
-            uh * uw,
-            device=device,
-            BLOCK_SIZE=128,
-        )
-
-
 # Attention elements per SDPA call before tiled local/retrieval NA splits tiles.
 _NA_ELEMENT_CAP = 2**27
 
@@ -749,15 +690,12 @@ class _SpatialAttention(_WindowAttention):
         window: int,
         *,
         pos_bias: str = "rfb",
-        g_attention_impl: Literal["sdpa", "direct"] = "sdpa",
         context_na: bool | None = None,
         context_overlap: bool | None = None,
         **kwargs,
     ) -> None:
         if pos_bias not in ("rfb", "rpb", "rib", "none"):
             raise ValueError("pos_bias must be rfb/rpb/rib/none")
-        if g_attention_impl not in ("sdpa", "direct"):
-            raise ValueError("g_attention_impl must be sdpa/direct")
         context_na = _resolve_context_na(context_na, context_overlap, default=False)
         super().__init__(
             channels,
@@ -769,22 +707,13 @@ class _SpatialAttention(_WindowAttention):
         if pos_bias == "rfb":
             self.factored_bias = RelativeFourierBias(heads, kwargs.get("rank", 16))
             self.pos_bias = "rfb"
-        self.g_attention_impl = g_attention_impl
         if context_na and (pos_bias != "rfb" or self.logit_scale is not None):
             raise ValueError("context_na requires RFB bias and dot-product attention")
         self.context_na = context_na
         # DUAL enables this on its dense-RPB local layers; see _local_na_core.
         self.local_na = False
         self.na_training_fast = False
-        self.attn_type: Literal["masked", "hybrid"] = "masked"
-        self._flex_masks: dict[tuple[int, int, int], Any] = {}
         self.direct_fallback_reason: str | None = None
-
-    def _apply(self, fn: Any, recurse: bool = True) -> _SpatialAttention:
-        # BlockMasks are runtime geometry, not buffers or checkpoint contents.
-        # Device/dtype moves require fresh preparation on the destination.
-        self._flex_masks.clear()
-        return super()._apply(fn, recurse=recurse)
 
     @property
     def context_overlap(self) -> bool:
@@ -817,27 +746,24 @@ class _SpatialAttention(_WindowAttention):
     def attend_windows(
         self, tokens: Tensor, window_shape: tuple[int, int], mask: Tensor | None = None
     ) -> Tensor:
-        if self.g_attention_impl == "sdpa" or self.pos_bias != "rpb":
-            return super().attend_windows(tokens, window_shape, mask)
-        if (
-            tokens.device.type != "cuda"
-            or self.window_mode != "anchored"
-            or self.window not in (16, 32)
-            or window_shape != (self.window, self.window)
-            or mask is not None
-            or self.logit_scale is not None
+        # Training calls of anchored full G16/G32 dense-RPB windows take the
+        # fixed-window kernel; everything else keeps SDPA.
+        if not (
+            self.training
+            and self.pos_bias == "rpb"
+            and self.window_mode == "anchored"
+            and self.window in (16, 32)
+            and window_shape == (self.window, self.window)
+            and mask is None
+            and self.logit_scale is None
+            and not torch.onnx.is_in_onnx_export()
+            and self._direct_capable(tokens, "fixed-window kernel")
         ):
-            self._record_direct_fallback(
-                "requires CUDA, anchored full G16/G32, no mask and dot attention"
-            )
             return super().attend_windows(tokens, window_shape, mask)
         batch_windows, count, channels = tokens.shape
         head_dim = channels // self.heads
         qkv = self.qkv(tokens).reshape(batch_windows, count, 3, self.heads, head_dim)
         query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        if query.dtype not in (torch.bfloat16, torch.float16):
-            self._record_direct_fallback("requires BF16 or FP16 attention inputs")
-            return super().attend_windows(tokens, window_shape, mask)
         operands = (
             (query * (head_dim**-0.5)).contiguous(),
             key.contiguous(),
@@ -971,33 +897,6 @@ class _SpatialAttention(_WindowAttention):
         # Positional factors extend Q/K only. Zero V lanes never contribute to
         # the returned channels; the supported training backend accepts Dv!=Dq.
         vt = vt.contiguous() if fast else F.pad(vt, (0, rank)).contiguous()
-        if (
-            fast
-            and self.attn_type == "hybrid"
-            and torch.compiler.is_compiling()
-            and not torch.onnx.is_in_onnx_export()
-        ):
-            block = self._flex_masks.get((height, width, first))
-            if block is None:
-                raise RuntimeError(
-                    "DUAL hybrid mask missing: call prepare_for_compile with the "
-                    "actual input shape and dtype after moving the model to CUDA"
-                )
-            # Content32 + RFB16 becomes64 by appending exact zeros. V stays32;
-            # learned RFB factors remain ordinary differentiable Q/K operands.
-            padded = 1 << (qt.shape[-1] - 1).bit_length()
-            attended = flex_attention(
-                F.pad(qt, (0, padded - qt.shape[-1])),
-                F.pad(kt, (0, padded - kt.shape[-1])),
-                vt,
-                block_mask=block,
-                scale=1.0,
-            )
-            return (
-                attended.reshape(count, batch, heads, tile, tile, dim)
-                .permute(1, 0, 2, 5, 3, 4)
-                .reshape(batch, count, channels, tile, tile)
-            )
         sy = (qp[..., 0] - kh // 2).clamp(0, height - kh)
         sx = (qp[..., 1] - kw // 2).clamp(0, width - kw)
         ky = ko[:, 0, None] + torch.arange(uh, device=query.device)[None]
@@ -1142,9 +1041,10 @@ class _SpatialAttention(_WindowAttention):
             .reshape(batch, channels, ty * tile, tx * tile)[:, :, :height, :width]
         )
 
-    def _direct_capable(self, x: Tensor, dtypes: tuple, reason: str) -> bool:
-        # The layer was prepared for the direct kernel; report once if this
-        # call cannot use it (device, effective dtype or Triton missing).
+    def _direct_capable(self, x: Tensor, kernel: str) -> bool:
+        # CUDA BF16/FP16 calls take the bundled kernel. When Triton or the
+        # torch.library Triton APIs are missing, report it once per layer so a
+        # slow fallback is never silent; CPU and FP32/FP64 calls keep SDPA.
         dtype = (
             torch.get_autocast_dtype(x.device.type)
             if torch.is_autocast_enabled(x.device.type)
@@ -1152,24 +1052,24 @@ class _SpatialAttention(_WindowAttention):
             and self.qkv.weight.dtype != torch.float64
             else x.dtype
         )
-        if _HAS_DIRECT_ATTENTION and x.device.type == "cuda" and dtype in dtypes:
+        if x.device.type != "cuda" or dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if _HAS_DIRECT_ATTENTION:
             return True
-        self._record_direct_fallback(reason)
+        self._record_direct_fallback(f"{kernel} unavailable ({_DIRECT_ATTENTION_ERROR})")
         return False
 
     def _use_direct_na(self, x: Tensor) -> bool:
-        # Training path chosen by prepare_for_compile; eval/export keep SDPA.
+        # Training calls only; eval and export keep SDPA.
         return (
-            self.g_attention_impl == "direct"
-            and self.training
+            self.training
+            and self.pos_bias == "rpb"
+            and self.window_mode == "anchored"
+            and self.window in (16, 32)
             and self.logit_scale is None
             and min(x.shape[-2:]) >= self.window
             and not torch.onnx.is_in_onnx_export()
-            and self._direct_capable(
-                x,
-                (torch.bfloat16, torch.float16),
-                "local NA kernel needs CUDA BF16/FP16 and Triton",
-            )
+            and self._direct_capable(x, "local NA kernel")
         )
 
     def _local_na_direct(self, x: Tensor) -> Tensor:
@@ -1193,21 +1093,17 @@ class _SpatialAttention(_WindowAttention):
         return output.transpose(2, 3).reshape(batch, channels, height, width)
 
     def _use_direct_context(self, x: Tensor) -> bool:
-        # Training path chosen by prepare_for_compile for masked RFB context
-        # layers in BF16 or FP16; hybrid keeps Flex, deterministic mode keeps
-        # the SDPA paths.
+        # Training calls of RFB context layers; deterministic mode, eval and
+        # export keep the SDPA paths.
         return (
-            self.g_attention_impl == "direct"
-            and self.training
-            and self.attn_type == "masked"
+            self.training
+            and self.pos_bias == "rfb"
+            and self.window in (32, 64)
+            and self.factored_bias.rank == 16
             and self.logit_scale is None
             and not torch.are_deterministic_algorithms_enabled()
             and not torch.onnx.is_in_onnx_export()
-            and self._direct_capable(
-                x,
-                (torch.bfloat16, torch.float16),
-                "context NA kernel needs CUDA BF16/FP16 and Triton",
-            )
+            and self._direct_capable(x, "context NA kernel")
         )
 
     def _context_na_direct(self, x: Tensor) -> Tensor:
@@ -1430,9 +1326,9 @@ def attend_packed(
 ) -> Tensor:
     """Reuse packed query/key blocks for a value stream, then restore BCHW.
 
-    With training=True (the caller's module mode) and direct=True (set by
-    prepare_for_compile), CUDA BF16/FP16 retrieval NA runs on the bundled NA
-    kernel; every other case uses masked SDPA with the default backend order.
+    With training=True (the caller's module mode), CUDA BF16/FP16 retrieval NA
+    runs on the bundled NA kernel when Triton is available; every other case
+    uses masked SDPA with the default backend order.
     """
     layout, classes, batch = packed
     if isinstance(layout, NAGeometry):
@@ -1448,8 +1344,7 @@ def attend_packed(
             math.log(1024) * math.sqrt(32)
         )
         if (
-            direct
-            and training
+            training
             and _HAS_DIRECT_ATTENTION
             and query.device.type == "cuda"
             and query.dtype in (torch.bfloat16, torch.float16)
@@ -1598,8 +1493,6 @@ class SecondOctaveTransfer(nn.Module):
         self.value = nn.Conv2d(64, channels // 16, 1)
         self.out = nn.Conv2d(channels // 16, 3, 3, padding=1, bias=False)
         self.log_tau = nn.Parameter(torch.zeros(channels // 32))
-        # Set by DUAL.prepare_for_compile, like the main retrieval call.
-        self.retrieval_direct = False
         self.apply(_init_weights)
         nn.init.zeros_(self.out.weight)
 
@@ -1611,7 +1504,6 @@ class SecondOctaveTransfer(nn.Module):
             pack_grandchildren(g),
             self.log_tau,
             training=self.training,
-            direct=self.retrieval_direct,
         )
         r = unpack_grandchildren(o2)[:, :, : 4 * h, : 4 * w]
         return self.out(r)
@@ -1970,6 +1862,11 @@ def _premixed_conv3x3(
 ) -> Tensor:
     """One differentiable mixed kernel per sample, including batch > 1."""
     batch, channels, height, width = x.shape
+    # The batch becomes the convolution's groups, which Inductor needs as an
+    # integer. len(range()) makes it concrete under torch.compile (int() keeps
+    # it symbolic), so a new batch size compiles its own static graph instead
+    # of a dynamic one with symbolic groups.
+    batch = len(range(batch))
     dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
@@ -2065,7 +1962,6 @@ class _Layer(nn.Module):
         pos_bias: str,
         qk: QKMode,
         rank: int,
-        g_attention_impl: Literal["sdpa", "direct"],
     ) -> None:
         super().__init__()
         # Construction order is fixed to keep seeded initialization reproducible.
@@ -2080,7 +1976,6 @@ class _Layer(nn.Module):
             window_mode="anchored",
             qk=qk,
             rank=rank,
-            g_attention_impl=g_attention_impl,
         )
         self.ffn = ConvFFN(channels)
 
@@ -2102,7 +1997,6 @@ class _Group(nn.Module):
         g_window: int,
         qk: QKMode,
         rank: int,
-        g_attention_impl: Literal["sdpa", "direct"],
     ) -> None:
         super().__init__()
         self.use_checkpoint = use_checkpoint
@@ -2122,7 +2016,6 @@ class _Group(nn.Module):
                 pos_bias=bias,
                 qk=qk,
                 rank=rank,
-                g_attention_impl=g_attention_impl,
             )
             for window, shifted, bias in schedule
         )
@@ -2180,9 +2073,6 @@ class DUAL(nn.Module):
         qk: QKMode = "dot",
         ffn: Literal["conv"] = "conv",
         use_checkpoint: bool = True,
-        g_attention_impl: Literal["sdpa", "direct"] = "sdpa",
-        compile_g_attention_impl: Literal["sdpa", "direct"] = "direct",
-        attn_type: Literal["masked", "hybrid"] = "masked",
     ) -> None:
         super().__init__()
         _check_experts(dynamic_experts)
@@ -2196,16 +2086,6 @@ class DUAL(nn.Module):
                 raise ValueError(f"{name} must be a bool")
         if local_na and qk != "dot":
             raise ValueError("local_na requires qk='dot'; disable local_na for cosine")
-        if attn_type not in ("masked", "hybrid"):
-            raise ValueError("attn_type must be masked/hybrid")
-        if attn_type == "hybrid":
-            if not context_na:
-                raise ValueError("attn_type='hybrid' requires context_na=True")
-            if flex_attention is None:
-                raise ImportError(
-                    "DUAL hybrid attention requires PyTorch Flex Attention"
-                )
-        self.attn_type = attn_type
         if scale not in (1, 2, 4) or norm != "token":
             raise ValueError("DUAL requires scale 1/2/4 and token normalization")
         if not isinstance(embed_dim, int) or embed_dim < 32 or embed_dim % 32:
@@ -2249,18 +2129,12 @@ class DUAL(nn.Module):
             raise ValueError(
                 "context_na requires c_pos_bias='rfb' and qk='dot'; disable context_na for legacy alternatives"
             )
-        if compile_g_attention_impl not in ("sdpa", "direct"):
-            raise ValueError("compile_g_attention_impl must be sdpa/direct")
-        self.compile_g_attention_impl = compile_g_attention_impl
         self.scale = scale
         self.context_na = context_na
         self.local_na = local_na
         self.retrieval_na = retrieval_na
-        # Set by prepare_for_compile: retrieval NA on the bundled NA kernel.
-        self.retrieval_direct = False
         self.compile_cache_key_tag = (
-            f"dual-family-attention-v8:selective-checkpoint={use_checkpoint}"
-            f":attn-type={attn_type}"
+            f"dual-family-attention-v10:selective-checkpoint={use_checkpoint}"
         )
         self.unshuffle = pixel_unshuffle
         self.internal_scale = scale * (2 if pixel_unshuffle else 1)
@@ -2281,7 +2155,6 @@ class DUAL(nn.Module):
                     g_window=g_window,
                     qk=qk,
                     rank=rfb_rank,
-                    g_attention_impl=g_attention_impl,
                 )
                 for _ in range(groups)
             )
@@ -2313,7 +2186,6 @@ class DUAL(nn.Module):
             for index in (2, 5):
                 group.layers[index] = DualContextLayer(group.layers[index])
                 group.layers[index].attention.context_na = context_na
-                group.layers[index].attention.attn_type = attn_type
         for group, indices in zip(self.groups, selected, strict=True):
             group.layers = nn.ModuleList(group.layers[i] for i in indices)
         if self.unshuffle:
@@ -2396,7 +2268,6 @@ class DUAL(nn.Module):
             pack_children(self.xr.value(u)),
             self.xr.log_tau,
             training=self.training,
-            direct=self.retrieval_direct,
         )
         lr = self.xr.project(o * self.xr.gate(u).sigmoid())[:, :, :height, :width]
         hr = (
@@ -2430,51 +2301,19 @@ class DUAL(nn.Module):
         input_shape: tuple[int, ...] | None = None,
         input_dtype: torch.dtype | None = None,
     ) -> None:
-        """Select training execution paths without changing model mathematics.
+        """Prepare BF16 training without changing model mathematics.
 
-        Every preset and scale shares these capability checks: no width, depth
-        or preset-specific restriction is needed. Hybrid masks are shared across
-        equal context windows and primed for the actual trunk size, including
-        PU2 padding. Repeated calls replace caches; eval/export keep portable SDPA.
-        Per-call device/dtype/geometry checks still govern actual execution.
-        One switch (compile_g_attention_impl) selects the bundled kernels for
-        fixed G windows, local NA, masked context NA and retrieval NA.
+        traiNNer's hook passes input_shape and input_dtype; only input_dtype is
+        used. BF16 training folds context images into heads to share masks, the
+        layout the context SDPA path uses when its kernel cannot run
+        (deterministic mode). The bundled kernels need no preparation: every
+        CUDA BF16/FP16 training call takes them where they can run.
         """
+        del input_shape
         training = self.training and not self.deployed
         bf16_context = training and input_dtype == torch.bfloat16
-        direct_local = (
-            training
-            and self.compile_g_attention_impl == "direct"
-            and input_dtype in (torch.bfloat16, torch.float16)
-        )
-        self.retrieval_direct = bool(direct_local)
-        if self.xg is not None:
-            self.xg.retrieval_direct = self.retrieval_direct
-        flex_shape = None
-        if (
-            bf16_context
-            and self.attn_type == "hybrid"
-            and self.mean.device.type == "cuda"
-            and not torch.are_deterministic_algorithms_enabled()
-        ):
-            if (
-                input_shape is None
-                or len(input_shape) != 4
-                or any(type(d) is not int or d < 1 for d in input_shape)
-                or input_shape[1] != 3
-            ):
-                raise ValueError(
-                    "Hybrid compilation requires a fixed positive BCHW RGB input_shape"
-                )
-            height, width = input_shape[-2:]
-            if self.unshuffle:
-                height, width = ((height + 3) // 4) * 2, ((width + 3) // 4) * 2
-            flex_shape = height, width
-        shared_masks: dict[tuple[int, int], Any] = {}
         for layer in self.modules():
             if isinstance(layer, _SpatialAttention):
-                masks: dict[tuple[int, int, int], Any] = {}
-                layer._flex_masks = masks  # noqa: SLF001 - Model owns runtime caches.
                 layer.na_training_fast = bool(
                     bf16_context
                     and layer.context_na
@@ -2482,41 +2321,9 @@ class DUAL(nn.Module):
                     and layer.window in (32, 64)
                     and layer.factored_bias.rank == 16
                 )
-                if flex_shape is not None and layer.na_training_fast:
-                    height, width = flex_shape
-                    if height > layer.window or width > layer.window:
-                        count = ((height + 15) // 16) * ((width + 15) // 16)
-                        for first in range(0, count, 4):
-                            key = layer.window, first
-                            if key not in shared_masks:
-                                shared_masks[key] = _na_block_mask(
-                                    height, width, layer.window, first, self.mean.device
-                                )
-                            masks[(height, width, first)] = shared_masks[key]
-                # One switch (compile_g_attention_impl) serves the dense-RPB
-                # windows/local NA and masked RFB context NA (BF16 or FP16).
-                layer.g_attention_impl = (
-                    "direct"
-                    if direct_local
-                    and (
-                        (
-                            layer.pos_bias == "rpb"
-                            and layer.window_mode == "anchored"
-                            and layer.window in (16, 32)
-                        )
-                        or (
-                            layer.context_na
-                            and layer.pos_bias == "rfb"
-                            and layer.window in (32, 64)
-                            and layer.factored_bias.rank == 16
-                            and layer.attn_type == "masked"
-                        )
-                    )
-                    else "sdpa"
-                )
 
     def prepare_for_export(self) -> None:
-        """Select portable SDPA and fold factors; call only on an eval COPY.
+        """Drop the training layout and fold factors; call only on an eval COPY.
 
         Like context_na, local_na and retrieval_na stay as configured: their
         neighborhoods export as index gathers plus masked SDPA.
@@ -2525,9 +2332,7 @@ class DUAL(nn.Module):
             raise RuntimeError("Call eval() on an export copy before folding DUAL")
         for layer in self.modules():
             if isinstance(layer, _SpatialAttention):
-                layer.g_attention_impl = "sdpa"
                 layer.na_training_fast = False
-                layer._flex_masks.clear()  # noqa: SLF001 - Drop export-only runtime state.
         if self.deployed:
             return
         for name in self.reparameterized_names:
@@ -4593,8 +4398,7 @@ else:
         preserve_layout: bool = False,
     ) -> Tensor:
         raise RuntimeError(
-            f"DUAL direct CUDA attention is unavailable: {_DIRECT_ATTENTION_ERROR}. Use "
-            "g_attention_impl='sdpa' and compile_g_attention_impl='sdpa' "
+            f"DUAL direct CUDA attention is unavailable: {_DIRECT_ATTENTION_ERROR}. "
             "or provide the required Triton/PyTorch APIs."
         )
 
