@@ -40,16 +40,33 @@ Convolution and reconstruction:
     requested scale; reconstruction heads and checkpoints are scale-specific.
 
 Execution:
-    Eager attention uses PyTorch SDPA; local and retrieval NA always use masked
-    SDPA. prepare_for_compile() selects the bundled direct fixed-window local
-    backend (only with local_na=False) and a mask-sharing BF16 context layout.
+    Eager, eval and export attention use PyTorch SDPA (local, context and
+    retrieval NA as masked SDPA over gathered key unions). For low-precision
+    training, prepare_for_compile() selects bundled Triton kernels under one
+    switch (compile_g_attention_impl='direct', the default): the fixed-window
+    dense-RPB kernel and one neighborhood-attention kernel family that reads
+    Q/K/V from the full maps, used three ways:
+      local NA   - dense RPB table; training, CUDA, BF16/FP16, both map sides
+                   at least one window;
+      context NA - Fourier bias factors as extra Q/K columns; masked RFB layers,
+                   training, CUDA, BF16/FP16, not deterministic mode;
+      retrieval  - fine queries over half-resolution keys (stride 2), shared
+                   with the second-octave transfer; training with gradients,
+                   CUDA, BF16/FP16, when the coarse key grid exceeds 48.
+    Everything else keeps the SDPA paths. Constructing with
+    g_attention_impl='direct' selects the direct kernels for training in eager
+    mode as well (the existing meaning for the fixed-window kernel); the
+    default 'sdpa' keeps eager on the reference paths. Inductor keeps its own
+    options in every compile mode. compile_cache_key_tag
+    ('dual-family-attention-v8...') versions this compiler-facing contract.
     The same execution policy applies to every preset and output scale; runtime
     device, dtype and attention geometry determine which backend can execute.
     use_checkpoint=True enables selective whole-layer checkpointing in training:
     save expensive attention results and recompute surrounding intermediates.
     Set it to False to disable explicit checkpointing. Eval/export never use it.
-    attn_type="masked" keeps SDPA; opt-in "hybrid" uses Flex for compiled BF16
-    masked context NA only. Unmasked attention, eager/eval and export keep SDPA.
+    attn_type="masked" keeps the paths above; opt-in "hybrid" uses Flex for
+    compiled BF16 context NA only. Unmasked attention, eager/eval and export
+    keep SDPA.
     Hybrid requires PyTorch Flex/Triton and prepare_for_compile(input_shape,
     input_dtype) after moving the model to CUDA; traiNNer calls this hook.
     These execution options do not promise bitwise equivalence across backends.
@@ -126,9 +143,9 @@ def _selective_checkpoint_policy(
     )
     if op in saved or (_FLEX_ATTENTION_OP is not None and op is _FLEX_ATTENTION_OP):
         return CheckpointPolicy.MUST_SAVE
-    if (
-        _HAS_DIRECT_ATTENTION
-        and op is torch.ops.dual_standalone.dense_rpb_attention.default
+    if _HAS_DIRECT_ATTENTION and op in (
+        torch.ops.dual_standalone.dense_rpb_attention.default,
+        torch.ops.dual_standalone.neighborhood_attention.default,
     ):
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
@@ -834,6 +851,15 @@ class _SpatialAttention(_WindowAttention):
         )
         return output.transpose(1, 2).reshape(batch_windows, count, channels)
 
+    def _project_qkv(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Project a BCHW map to per-head (batch, head, token, dim) Q/K/V."""
+        batch, channels, height, width = x.shape
+        heads, dim = self.heads, channels // self.heads
+        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+        qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        return query, key, value
+
     def _na_chunk(
         self,
         query: Tensor,
@@ -1026,10 +1052,8 @@ class _SpatialAttention(_WindowAttention):
         if self.pos_bias != "rfb" or self.logit_scale is not None:
             raise ValueError("context_na requires RFB bias and dot-product attention")
         batch, channels, height, width = x.shape
-        heads, dim = self.heads, channels // self.heads
-        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
-        qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
-        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        dim = channels // self.heads
+        query, key, value = self._project_qkv(x)
         query = query * dim**-0.5
         output = x.new_empty((batch, channels, height, width), dtype=query.dtype)
         tile, chunk_size = 16, 4
@@ -1069,9 +1093,7 @@ class _SpatialAttention(_WindowAttention):
         geometry = na_geometry(
             (height, width), (height, width), window, tile, 1, x.device
         )
-        tokens = x.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
-        qkv = self.qkv(tokens).reshape(batch, height * width, 3, heads, dim)
-        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        query, key, value = self._project_qkv(x)
         query = query * (dim**-0.5)
         dtype = query.dtype
         span = 2 * window - 1
@@ -1120,13 +1142,113 @@ class _SpatialAttention(_WindowAttention):
             .reshape(batch, channels, ty * tile, tx * tile)[:, :, :height, :width]
         )
 
+    def _direct_capable(self, x: Tensor, dtypes: tuple, reason: str) -> bool:
+        # The layer was prepared for the direct kernel; report once if this
+        # call cannot use it (device, effective dtype or Triton missing).
+        dtype = (
+            torch.get_autocast_dtype(x.device.type)
+            if torch.is_autocast_enabled(x.device.type)
+            and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and self.qkv.weight.dtype != torch.float64
+            else x.dtype
+        )
+        if _HAS_DIRECT_ATTENTION and x.device.type == "cuda" and dtype in dtypes:
+            return True
+        self._record_direct_fallback(reason)
+        return False
+
+    def _use_direct_na(self, x: Tensor) -> bool:
+        # Training path chosen by prepare_for_compile; eval/export keep SDPA.
+        return (
+            self.g_attention_impl == "direct"
+            and self.training
+            and self.logit_scale is None
+            and min(x.shape[-2:]) >= self.window
+            and not torch.onnx.is_in_onnx_export()
+            and self._direct_capable(
+                x,
+                (torch.bfloat16, torch.float16),
+                "local NA kernel needs CUDA BF16/FP16 and Triton",
+            )
+        )
+
+    def _local_na_direct(self, x: Tensor) -> Tensor:
+        """_local_na_core's neighborhoods and dense bias on the bundled kernel.
+
+        Reads Q/K/V from the full projected maps: no gathered copies, float
+        mask or bias scatter. CUDA BF16/FP16; the caller routes other cases.
+        """
+        batch, channels, height, width = x.shape
+        dim = channels // self.heads
+        query, key, value = self._project_qkv(x)
+        output = local_na_attention(
+            (query * (dim**-0.5)).contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            self.relative_bias,
+            height,
+            width,
+            self.window,
+        )
+        return output.transpose(2, 3).reshape(batch, channels, height, width)
+
+    def _use_direct_context(self, x: Tensor) -> bool:
+        # Training path chosen by prepare_for_compile for masked RFB context
+        # layers in BF16 or FP16; hybrid keeps Flex, deterministic mode keeps
+        # the SDPA paths.
+        return (
+            self.g_attention_impl == "direct"
+            and self.training
+            and self.attn_type == "masked"
+            and self.logit_scale is None
+            and not torch.are_deterministic_algorithms_enabled()
+            and not torch.onnx.is_in_onnx_export()
+            and self._direct_capable(
+                x,
+                (torch.bfloat16, torch.float16),
+                "context NA kernel needs CUDA BF16/FP16 and Triton",
+            )
+        )
+
+    def _context_na_direct(self, x: Tensor) -> Tensor:
+        """_na_core's neighborhoods and Fourier bias on the bundled NA kernel.
+
+        The bias factors ride along as extra Q/K columns, evaluated at map
+        coordinates centred on the map (the bias depends only on query minus
+        key). CUDA BF16/FP16; the caller routes other cases to _na_core.
+        """
+        batch, channels, height, width = x.shape
+        dim = channels // self.heads
+        query, key, value = self._project_qkv(x)
+        coordinates = _na_coordinates(height, width, x.device) - torch.tensor(
+            (height // 2, width // 2), device=x.device
+        )
+        bias_query, bias_key = self.factored_bias.factors(coordinates, query.dtype)
+        expand = (batch, -1, -1, -1)
+        output = context_na_attention(
+            torch.cat(
+                (query * dim**-0.5, bias_query[None].expand(expand)), -1
+            ).contiguous(),
+            torch.cat((key, bias_key[None].expand(expand)), -1).contiguous(),
+            value.contiguous(),
+            height,
+            width,
+            min(self.window, height),
+            min(self.window, width),
+        )
+        return output.transpose(2, 3).reshape(batch, channels, height, width)
+
     def pre_gate_core(self, x: Tensor) -> Tensor:
         if x.ndim != 4 or x.shape[1] != self.channels or min(x.shape[2:]) < 1:
             raise ValueError("expected nonempty BCHW input with matching channels")
         batch, channels, height, width = x.shape
         if self.context_na and (height > self.window or width > self.window):
+            if self._use_direct_context(x):
+                return self._context_na_direct(x)
             return self._na_core(x)
         if self.local_na and (height > self.window or width > self.window):
+            if self._use_direct_na(x):
+                return self._local_na_direct(x)
             return self._local_na_core(x)
         wh, ww = min(height, self.window), min(width, self.window)
         if (
@@ -1282,7 +1404,7 @@ def pack_qk(q: Tensor, k: Tensor, *, na: bool = False) -> tuple:
             tuple(q.shape[-2:]), tuple(k.shape[-2:]), 48, 8, 2, q.device
         )
         query, key = (t.reshape(batch * heads, 32, -1).transpose(1, 2) for t in (q, k))
-        return geometry, (query, key), q.shape
+        return geometry, (query, key), (q.shape, tuple(k.shape[-2:]))
     layout = block_layout(*q.shape[-2:], 96)
     classes = []
     for _, items in grouped_layout(layout):
@@ -1298,12 +1420,24 @@ def pack_qk(q: Tensor, k: Tensor, *, na: bool = False) -> tuple:
     return layout, classes, q.shape[0]
 
 
-def attend_packed(packed: tuple, v: Tensor, log_tau: Tensor) -> Tensor:
-    """Reuse packed query/key blocks for a value stream, then restore BCHW."""
+def attend_packed(
+    packed: tuple,
+    v: Tensor,
+    log_tau: Tensor,
+    *,
+    training: bool = False,
+    direct: bool = False,
+) -> Tensor:
+    """Reuse packed query/key blocks for a value stream, then restore BCHW.
+
+    With training=True (the caller's module mode) and direct=True (set by
+    prepare_for_compile), CUDA BF16/FP16 retrieval NA runs on the bundled NA
+    kernel; every other case uses masked SDPA with the default backend order.
+    """
     layout, classes, batch = packed
     if isinstance(layout, NAGeometry):
         query, key = classes
-        images, channels, height, width = batch
+        (images, channels, height, width), key_shape = batch
         heads = channels // 32
         value = v.reshape(query.shape[0], 32, -1).transpose(1, 2)
         tau = log_tau.exp().clamp(0.1, 10).to(query.dtype).repeat(images)
@@ -1313,6 +1447,32 @@ def attend_packed(packed: tuple, v: Tensor, log_tau: Tensor) -> Tensor:
         scale = math.log(layout.window[0] * layout.window[1]) / (
             math.log(1024) * math.sqrt(32)
         )
+        if (
+            direct
+            and training
+            and _HAS_DIRECT_ATTENTION
+            and query.device.type == "cuda"
+            and query.dtype in (torch.bfloat16, torch.float16)
+            and not torch.onnx.is_in_onnx_export()
+        ):
+            key_height, key_width = key_shape
+            output = retrieval_na_attention(
+                query[:, None].contiguous(),
+                key[:, None].contiguous(),
+                value[:, None].contiguous(),
+                height,
+                width,
+                key_height,
+                key_width,
+                layout.window[0],
+                layout.window[1],
+                scale,
+            )
+            return (
+                output.reshape(images, heads, height, width, 32)
+                .permute(0, 1, 4, 2, 3)
+                .reshape(images, channels, height, width)
+            )
 
         def gather(t: Tensor, index: Tensor) -> Tensor:
             return t.index_select(1, index.reshape(-1)).reshape(
@@ -1438,13 +1598,21 @@ class SecondOctaveTransfer(nn.Module):
         self.value = nn.Conv2d(64, channels // 16, 1)
         self.out = nn.Conv2d(channels // 16, 3, 3, padding=1, bias=False)
         self.log_tau = nn.Parameter(torch.zeros(channels // 32))
+        # Set by DUAL.prepare_for_compile, like the main retrieval call.
+        self.retrieval_direct = False
         self.apply(_init_weights)
         nn.init.zeros_(self.out.weight)
 
     def forward(self, t2: Tensor, packed: tuple, shape: tuple[int, int]) -> Tensor:
         h, w = shape
         g = F.pad(self.value(t2), (0, 2 * (w % 2), 0, 2 * (h % 2)), mode="replicate")
-        o2 = attend_packed(packed, pack_grandchildren(g), self.log_tau)
+        o2 = attend_packed(
+            packed,
+            pack_grandchildren(g),
+            self.log_tau,
+            training=self.training,
+            direct=self.retrieval_direct,
+        )
         r = unpack_grandchildren(o2)[:, :, : 4 * h, : 4 * w]
         return self.out(r)
 
@@ -2088,8 +2256,10 @@ class DUAL(nn.Module):
         self.context_na = context_na
         self.local_na = local_na
         self.retrieval_na = retrieval_na
+        # Set by prepare_for_compile: retrieval NA on the bundled NA kernel.
+        self.retrieval_direct = False
         self.compile_cache_key_tag = (
-            f"dual-family-attention-v5:selective-checkpoint={use_checkpoint}"
+            f"dual-family-attention-v8:selective-checkpoint={use_checkpoint}"
             f":attn-type={attn_type}"
         )
         self.unshuffle = pixel_unshuffle
@@ -2221,7 +2391,13 @@ class DUAL(nn.Module):
         q = self.xr.query(torch.cat((self.xr.norm_f(pad_even(fine)), u), 1))
         k = self.xr.key(self.xr.norm_f(coarse))
         packed = pack_qk(q, k, na=self.retrieval_na)
-        o = attend_packed(packed, pack_children(self.xr.value(u)), self.xr.log_tau)
+        o = attend_packed(
+            packed,
+            pack_children(self.xr.value(u)),
+            self.xr.log_tau,
+            training=self.training,
+            direct=self.retrieval_direct,
+        )
         lr = self.xr.project(o * self.xr.gate(u).sigmoid())[:, :, :height, :width]
         hr = (
             self.xr.hr(unpack_children(o))[:, :, : 2 * height, : 2 * width]
@@ -2261,8 +2437,8 @@ class DUAL(nn.Module):
         equal context windows and primed for the actual trunk size, including
         PU2 padding. Repeated calls replace caches; eval/export keep portable SDPA.
         Per-call device/dtype/geometry checks still govern actual execution.
-        The direct local backend implements fixed G windows, so it is selected
-        only for layers with local_na off; local and retrieval NA use SDPA.
+        One switch (compile_g_attention_impl) selects the bundled kernels for
+        fixed G windows, local NA, masked context NA and retrieval NA.
         """
         training = self.training and not self.deployed
         bf16_context = training and input_dtype == torch.bfloat16
@@ -2271,6 +2447,9 @@ class DUAL(nn.Module):
             and self.compile_g_attention_impl == "direct"
             and input_dtype in (torch.bfloat16, torch.float16)
         )
+        self.retrieval_direct = bool(direct_local)
+        if self.xg is not None:
+            self.xg.retrieval_direct = self.retrieval_direct
         flex_shape = None
         if (
             bf16_context
@@ -2314,13 +2493,25 @@ class DUAL(nn.Module):
                                     height, width, layer.window, first, self.mean.device
                                 )
                             masks[(height, width, first)] = shared_masks[key]
+                # One switch (compile_g_attention_impl) serves the dense-RPB
+                # windows/local NA and masked RFB context NA (BF16 or FP16).
                 layer.g_attention_impl = (
                     "direct"
                     if direct_local
-                    and not layer.local_na
-                    and layer.pos_bias == "rpb"
-                    and layer.window_mode == "anchored"
-                    and layer.window in (16, 32)
+                    and (
+                        (
+                            layer.pos_bias == "rpb"
+                            and layer.window_mode == "anchored"
+                            and layer.window in (16, 32)
+                        )
+                        or (
+                            layer.context_na
+                            and layer.pos_bias == "rfb"
+                            and layer.window in (32, 64)
+                            and layer.factored_bias.rank == 16
+                            and layer.attn_type == "masked"
+                        )
+                    )
                     else "sdpa"
                 )
 
@@ -2347,7 +2538,9 @@ class DUAL(nn.Module):
 
 
 # Optional fused local-attention backend.
-# This bundled dense-RPB kernel serves fixed G16/G32 windows, not NA layers.
+# These bundled kernels serve fixed G16/G32 dense-RPB windows and, for
+# compiled training, local and context NA layers (local_na_attention,
+# context_na_attention).
 # Missing optional APIs are reported when direct execution is requested; SDPA
 # remains available without Triton.
 _DIRECT_ATTENTION_ERROR: str | None = None
@@ -3475,6 +3668,916 @@ if _HAS_DIRECT_ATTENTION:
         )
         return output
 
+    # Direct neighborhood attention for compiled training, read straight from the
+    # full (batch, head, token, channel) maps: no gathered key unions, masks or
+    # scatters. Query q attends keys with origin clamp(q - window // 2, 0, length
+    # - window) per axis (a window_y x window_x neighborhood). Local NA adds the
+    # dense RPB table[(qy - ky + wy - 1) * (2 * wx - 1) + qx - kx + wx - 1];
+    # context NA carries its Fourier bias factors as extra Q/K columns, so Q/K may
+    # be wider than V. Programs own TILE x TILE query tiles; a tile's key union
+    # fits in _na_blocks(window) TILE-row blocks per axis from the first query's
+    # origin. Backward: dQ per query tile (plus dS per window slot with a table),
+    # dK/dV per key tile over the query blocks that see it; no atomics.
+
+    _NA_TILE = 8
+    _NA_FWD_WARPS = 4
+    _NA_BWD_WARPS = 4
+
+    def _na_blocks(window: int, stride: int = 1) -> int:
+        # Key blocks covering a query tile's union: window + (TILE - 1) // stride.
+        return (window + (_NA_TILE - 1) // stride + _NA_TILE - 1) // _NA_TILE
+
+    @triton.jit
+    def _na_window_start(position, length: tl.constexpr, WINDOW: tl.constexpr):
+        return tl.minimum(tl.maximum(position - WINDOW // 2, 0), length - WINDOW)
+
+    @triton.jit
+    def _na_query_span(
+        first,
+        last,
+        key_length: tl.constexpr,
+        query_length: tl.constexpr,
+        WINDOW: tl.constexpr,
+        STRIDE: tl.constexpr,
+    ):
+        # Inclusive query range whose windows touch key rows [first, last];
+        # query p's window starts at clamp(p // STRIDE - WINDOW // 2).
+        low = tl.where(
+            first - WINDOW + 1 <= 0, 0, STRIDE * (first - WINDOW + 1 + WINDOW // 2)
+        )
+        high = tl.where(
+            last >= key_length - WINDOW,
+            query_length - 1,
+            tl.minimum(STRIDE * (last + WINDOW // 2) + STRIDE - 1, query_length - 1),
+        )
+        return low, high
+
+    @triton.jit
+    def _na_scores(
+        query,
+        key,
+        scale,
+        table_ptr,
+        table_stride_relative,
+        table_stride_head,
+        head,
+        query_y,
+        query_x,
+        start_y,
+        start_x,
+        query_valid,
+        key_y,
+        key_x,
+        key_in,
+        WINDOW_Y: tl.constexpr,
+        WINDOW_X: tl.constexpr,
+        HAS_TABLE: tl.constexpr,
+        DTYPE_CODE: tl.constexpr,
+    ):
+        valid = (
+            query_valid[:, None]
+            & key_in[None, :]
+            & (key_y[None, :] >= start_y[:, None])
+            & (key_y[None, :] < start_y[:, None] + WINDOW_Y)
+            & (key_x[None, :] >= start_x[:, None])
+            & (key_x[None, :] < start_x[:, None] + WINDOW_X)
+        )
+        score = tl.dot(query, tl.trans(key)) * scale
+        if HAS_TABLE:
+            relative = (query_y[:, None] - key_y[None, :] + WINDOW_Y - 1) * (
+                2 * WINDOW_X - 1
+            ) + (query_x[:, None] - key_x[None, :] + WINDOW_X - 1)
+            bias = tl.load(
+                table_ptr + relative * table_stride_relative + head * table_stride_head,
+                mask=valid,
+                other=0.0,
+            )
+            score += _rounded_bias(bias, DTYPE_CODE)
+        return tl.where(valid, score, -float("inf")), valid
+
+    @triton.jit
+    def _na_forward_kernel(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        table_ptr,
+        output_ptr,
+        lse_ptr,
+        qk_stride_batch,
+        qk_stride_head,
+        qk_stride_token,
+        k_stride_batch,
+        k_stride_head,
+        k_stride_token,
+        v_stride_batch,
+        v_stride_head,
+        v_stride_token,
+        o_stride_batch,
+        o_stride_head,
+        o_stride_token,
+        table_stride_relative,
+        table_stride_head,
+        height: tl.constexpr,
+        width: tl.constexpr,
+        num_heads: tl.constexpr,
+        key_height: tl.constexpr,
+        key_width: tl.constexpr,
+        STRIDE: tl.constexpr,
+        scale,
+        QK_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        WINDOW_Y: tl.constexpr,
+        WINDOW_X: tl.constexpr,
+        HAS_TABLE: tl.constexpr,
+        DTYPE_CODE: tl.constexpr,
+        TILE: tl.constexpr,
+        BLOCKS_Y: tl.constexpr,
+        BLOCKS_X: tl.constexpr,
+        BLOCK_QK: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        tile = tl.program_id(0)
+        # int64: batch-head x tokens x slots can exceed 2**31.
+        batch_head = tl.program_id(1).to(tl.int64)
+        batch = batch_head // num_heads
+        head = batch_head - batch * num_heads
+        tiles_x = (width + TILE - 1) // TILE
+        tile_y = tile // tiles_x
+        tile_x = tile - tile_y * tiles_x
+        local = tl.arange(0, TILE * TILE)
+        qk_channel = tl.arange(0, BLOCK_QK)
+        qk_valid = qk_channel < QK_DIM
+        v_channel = tl.arange(0, BLOCK_V)
+        v_valid = v_channel < V_DIM
+        qk_base = batch * qk_stride_batch + head * qk_stride_head
+        k_base = batch * k_stride_batch + head * k_stride_head
+        v_base = batch * v_stride_batch + head * v_stride_head
+        o_base = batch * o_stride_batch + head * o_stride_head
+
+        query_y = tile_y * TILE + local // TILE
+        query_x = tile_x * TILE + local % TILE
+        query_valid = (query_y < height) & (query_x < width)
+        query_token = query_y * width + query_x
+        query = tl.load(
+            query_ptr
+            + qk_base
+            + query_token[:, None] * qk_stride_token
+            + qk_channel[None, :],
+            mask=query_valid[:, None] & qk_valid[None, :],
+            other=0.0,
+        )
+        start_y = _na_window_start(query_y // STRIDE, key_height, WINDOW_Y)
+        start_x = _na_window_start(query_x // STRIDE, key_width, WINDOW_X)
+        origin_y = _na_window_start(tile_y * TILE // STRIDE, key_height, WINDOW_Y)
+        origin_x = _na_window_start(tile_x * TILE // STRIDE, key_width, WINDOW_X)
+
+        row_max = tl.full((TILE * TILE,), -float("inf"), tl.float32)
+        row_sum = tl.zeros((TILE * TILE,), tl.float32)
+        accumulator = tl.zeros((TILE * TILE, BLOCK_V), tl.float32)
+        # One flattened, software-pipelined loop over the candidate blocks.
+        for block in tl.range(0, BLOCKS_Y * BLOCKS_X, num_stages=2):
+            block_y = block // BLOCKS_X
+            block_x = block - block_y * BLOCKS_X
+            key_y = origin_y + block_y * TILE + local // TILE
+            key_x = origin_x + block_x * TILE + local % TILE
+            key_in = (key_y < key_height) & (key_x < key_width)
+            key_token = key_y * key_width + key_x
+            key = tl.load(
+                key_ptr
+                + k_base
+                + key_token[:, None] * k_stride_token
+                + qk_channel[None, :],
+                mask=key_in[:, None] & qk_valid[None, :],
+                other=0.0,
+            )
+            score, _ = _na_scores(
+                query,
+                key,
+                scale,
+                table_ptr,
+                table_stride_relative,
+                table_stride_head,
+                head,
+                query_y,
+                query_x,
+                start_y,
+                start_x,
+                query_valid,
+                key_y,
+                key_x,
+                key_in,
+                WINDOW_Y,
+                WINDOW_X,
+                HAS_TABLE,
+                DTYPE_CODE,
+            )
+            new_max = tl.maximum(row_max, tl.max(score, axis=1))
+            safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+            probability = tl.exp(score - safe_max[:, None])
+            correction = tl.exp(row_max - safe_max)
+            row_sum = row_sum * correction + tl.sum(probability, axis=1)
+            accumulator *= correction[:, None]
+            value = tl.load(
+                value_ptr
+                + v_base
+                + key_token[:, None] * v_stride_token
+                + v_channel[None, :],
+                mask=key_in[:, None] & v_valid[None, :],
+                other=0.0,
+            )
+            if DTYPE_CODE == 1:
+                accumulator += tl.dot(probability.to(tl.bfloat16), value)
+            else:
+                accumulator += tl.dot(probability.to(tl.float16), value)
+            row_max = new_max
+
+        accumulator /= row_sum[:, None]
+        tl.store(
+            output_ptr
+            + o_base
+            + query_token[:, None] * o_stride_token
+            + v_channel[None, :],
+            accumulator,
+            mask=query_valid[:, None] & v_valid[None, :],
+        )
+        tl.store(
+            lse_ptr + batch_head * (height * width) + query_token,
+            row_max + tl.log(row_sum),
+            mask=query_valid,
+        )
+
+    @triton.jit
+    def _na_backward_query_kernel(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        table_ptr,
+        grad_output_ptr,
+        lse_ptr,
+        delta_ptr,
+        grad_query_ptr,
+        grad_score_ptr,
+        qk_stride_batch,
+        qk_stride_head,
+        qk_stride_token,
+        k_stride_batch,
+        k_stride_head,
+        k_stride_token,
+        v_stride_batch,
+        v_stride_head,
+        v_stride_token,
+        o_stride_batch,
+        o_stride_head,
+        o_stride_token,
+        table_stride_relative,
+        table_stride_head,
+        height: tl.constexpr,
+        width: tl.constexpr,
+        num_heads: tl.constexpr,
+        key_height: tl.constexpr,
+        key_width: tl.constexpr,
+        STRIDE: tl.constexpr,
+        scale,
+        QK_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        WINDOW_Y: tl.constexpr,
+        WINDOW_X: tl.constexpr,
+        HAS_TABLE: tl.constexpr,
+        DTYPE_CODE: tl.constexpr,
+        TILE: tl.constexpr,
+        BLOCKS_Y: tl.constexpr,
+        BLOCKS_X: tl.constexpr,
+        BLOCK_QK: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        # dQ per query tile; with a table also dS per query and window slot.
+        tile = tl.program_id(0)
+        # int64: batch-head x tokens x slots can exceed 2**31.
+        batch_head = tl.program_id(1).to(tl.int64)
+        batch = batch_head // num_heads
+        head = batch_head - batch * num_heads
+        tiles_x = (width + TILE - 1) // TILE
+        tile_y = tile // tiles_x
+        tile_x = tile - tile_y * tiles_x
+        local = tl.arange(0, TILE * TILE)
+        qk_channel = tl.arange(0, BLOCK_QK)
+        qk_valid = qk_channel < QK_DIM
+        v_channel = tl.arange(0, BLOCK_V)
+        v_valid = v_channel < V_DIM
+        qk_base = batch * qk_stride_batch + head * qk_stride_head
+        k_base = batch * k_stride_batch + head * k_stride_head
+        v_base = batch * v_stride_batch + head * v_stride_head
+        o_base = batch * o_stride_batch + head * o_stride_head
+
+        query_y = tile_y * TILE + local // TILE
+        query_x = tile_x * TILE + local % TILE
+        query_valid = (query_y < height) & (query_x < width)
+        query_token = query_y * width + query_x
+        query_offset = (
+            qk_base + query_token[:, None] * qk_stride_token + qk_channel[None, :]
+        )
+        query_mask = query_valid[:, None] & qk_valid[None, :]
+        query = tl.load(query_ptr + query_offset, mask=query_mask, other=0.0)
+        grad_output = tl.load(
+            grad_output_ptr
+            + o_base
+            + query_token[:, None] * o_stride_token
+            + v_channel[None, :],
+            mask=query_valid[:, None] & v_valid[None, :],
+            other=0.0,
+        )
+        row = batch_head * (height * width) + query_token
+        lse = tl.load(lse_ptr + row, mask=query_valid, other=0.0)
+        delta = tl.load(delta_ptr + row, mask=query_valid, other=0.0)
+        start_y = _na_window_start(query_y // STRIDE, key_height, WINDOW_Y)
+        start_x = _na_window_start(query_x // STRIDE, key_width, WINDOW_X)
+        origin_y = _na_window_start(tile_y * TILE // STRIDE, key_height, WINDOW_Y)
+        origin_x = _na_window_start(tile_x * TILE // STRIDE, key_width, WINDOW_X)
+
+        grad_query = tl.zeros((TILE * TILE, BLOCK_QK), tl.float32)
+        # One flattened, software-pipelined loop over the candidate blocks.
+        for block in tl.range(0, BLOCKS_Y * BLOCKS_X, num_stages=2):
+            block_y = block // BLOCKS_X
+            block_x = block - block_y * BLOCKS_X
+            key_y = origin_y + block_y * TILE + local // TILE
+            key_x = origin_x + block_x * TILE + local % TILE
+            key_in = (key_y < key_height) & (key_x < key_width)
+            key_token = key_y * key_width + key_x
+            key = tl.load(
+                key_ptr
+                + k_base
+                + key_token[:, None] * k_stride_token
+                + qk_channel[None, :],
+                mask=key_in[:, None] & qk_valid[None, :],
+                other=0.0,
+            )
+            value = tl.load(
+                value_ptr
+                + v_base
+                + key_token[:, None] * v_stride_token
+                + v_channel[None, :],
+                mask=key_in[:, None] & v_valid[None, :],
+                other=0.0,
+            )
+            score, valid = _na_scores(
+                query,
+                key,
+                scale,
+                table_ptr,
+                table_stride_relative,
+                table_stride_head,
+                head,
+                query_y,
+                query_x,
+                start_y,
+                start_x,
+                query_valid,
+                key_y,
+                key_x,
+                key_in,
+                WINDOW_Y,
+                WINDOW_X,
+                HAS_TABLE,
+                DTYPE_CODE,
+            )
+            probability = tl.where(valid, tl.exp(score - lse[:, None]), 0.0)
+            grad_probability = tl.dot(grad_output, tl.trans(value))
+            grad_score = probability * (grad_probability - delta[:, None])
+            if DTYPE_CODE == 1:
+                grad_query += tl.dot(grad_score.to(tl.bfloat16), key)
+            else:
+                grad_query += tl.dot(grad_score.to(tl.float16), key)
+            if HAS_TABLE:
+                slot = (key_y[None, :] - start_y[:, None]) * WINDOW_X + (
+                    key_x[None, :] - start_x[:, None]
+                )
+                tl.store(
+                    grad_score_ptr + row[:, None] * (WINDOW_Y * WINDOW_X) + slot,
+                    grad_score,
+                    mask=valid,
+                )
+
+        tl.store(grad_query_ptr + query_offset, grad_query * scale, mask=query_mask)
+
+    @triton.jit
+    def _na_backward_key_value_kernel(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        table_ptr,
+        grad_output_ptr,
+        lse_ptr,
+        delta_ptr,
+        grad_key_ptr,
+        grad_value_ptr,
+        qk_stride_batch,
+        qk_stride_head,
+        qk_stride_token,
+        k_stride_batch,
+        k_stride_head,
+        k_stride_token,
+        v_stride_batch,
+        v_stride_head,
+        v_stride_token,
+        o_stride_batch,
+        o_stride_head,
+        o_stride_token,
+        table_stride_relative,
+        table_stride_head,
+        height: tl.constexpr,
+        width: tl.constexpr,
+        num_heads: tl.constexpr,
+        key_height: tl.constexpr,
+        key_width: tl.constexpr,
+        STRIDE: tl.constexpr,
+        scale,
+        QK_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        WINDOW_Y: tl.constexpr,
+        WINDOW_X: tl.constexpr,
+        HAS_TABLE: tl.constexpr,
+        DTYPE_CODE: tl.constexpr,
+        TILE: tl.constexpr,
+        BLOCK_QK: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        # dK/dV per key tile, iterating the query blocks that can see it.
+        tile = tl.program_id(0)
+        # int64: batch-head x tokens x slots can exceed 2**31.
+        batch_head = tl.program_id(1).to(tl.int64)
+        batch = batch_head // num_heads
+        head = batch_head - batch * num_heads
+        tiles_x = (key_width + TILE - 1) // TILE
+        tile_y = tile // tiles_x
+        tile_x = tile - tile_y * tiles_x
+        local = tl.arange(0, TILE * TILE)
+        qk_channel = tl.arange(0, BLOCK_QK)
+        qk_valid = qk_channel < QK_DIM
+        v_channel = tl.arange(0, BLOCK_V)
+        v_valid = v_channel < V_DIM
+        qk_base = batch * qk_stride_batch + head * qk_stride_head
+        k_base = batch * k_stride_batch + head * k_stride_head
+        v_base = batch * v_stride_batch + head * v_stride_head
+        o_base = batch * o_stride_batch + head * o_stride_head
+
+        key_y = tile_y * TILE + local // TILE
+        key_x = tile_x * TILE + local % TILE
+        key_in = (key_y < key_height) & (key_x < key_width)
+        key_token = key_y * key_width + key_x
+        key_offset = k_base + key_token[:, None] * k_stride_token + qk_channel[None, :]
+        key_mask = key_in[:, None] & qk_valid[None, :]
+        value_offset = v_base + key_token[:, None] * v_stride_token + v_channel[None, :]
+        value_mask = key_in[:, None] & v_valid[None, :]
+        key = tl.load(key_ptr + key_offset, mask=key_mask, other=0.0)
+        value = tl.load(value_ptr + value_offset, mask=value_mask, other=0.0)
+        low_y, high_y = _na_query_span(
+            tile_y * TILE,
+            tl.minimum(tile_y * TILE + TILE - 1, key_height - 1),
+            key_height,
+            height,
+            WINDOW_Y,
+            STRIDE,
+        )
+        low_x, high_x = _na_query_span(
+            tile_x * TILE,
+            tl.minimum(tile_x * TILE + TILE - 1, key_width - 1),
+            key_width,
+            width,
+            WINDOW_X,
+            STRIDE,
+        )
+        blocks_y = (high_y - low_y + TILE) // TILE
+        blocks_x = (high_x - low_x + TILE) // TILE
+
+        grad_key = tl.zeros((TILE * TILE, BLOCK_QK), tl.float32)
+        grad_value = tl.zeros((TILE * TILE, BLOCK_V), tl.float32)
+        # One flattened, software-pipelined loop over the candidate blocks.
+        for block in tl.range(0, blocks_y * blocks_x, num_stages=2):
+            block_y = block // blocks_x
+            block_x = block - block_y * blocks_x
+            query_y = low_y + block_y * TILE + local // TILE
+            query_x = low_x + block_x * TILE + local % TILE
+            query_valid = (query_y <= high_y) & (query_x <= high_x)
+            query_token = query_y * width + query_x
+            query = tl.load(
+                query_ptr
+                + qk_base
+                + query_token[:, None] * qk_stride_token
+                + qk_channel[None, :],
+                mask=query_valid[:, None] & qk_valid[None, :],
+                other=0.0,
+            )
+            grad_output = tl.load(
+                grad_output_ptr
+                + o_base
+                + query_token[:, None] * o_stride_token
+                + v_channel[None, :],
+                mask=query_valid[:, None] & v_valid[None, :],
+                other=0.0,
+            )
+            row = batch_head * (height * width) + query_token
+            lse = tl.load(lse_ptr + row, mask=query_valid, other=0.0)
+            delta = tl.load(delta_ptr + row, mask=query_valid, other=0.0)
+            score, valid = _na_scores(
+                query,
+                key,
+                scale,
+                table_ptr,
+                table_stride_relative,
+                table_stride_head,
+                head,
+                query_y,
+                query_x,
+                _na_window_start(query_y // STRIDE, key_height, WINDOW_Y),
+                _na_window_start(query_x // STRIDE, key_width, WINDOW_X),
+                query_valid,
+                key_y,
+                key_x,
+                key_in,
+                WINDOW_Y,
+                WINDOW_X,
+                HAS_TABLE,
+                DTYPE_CODE,
+            )
+            probability = tl.where(valid, tl.exp(score - lse[:, None]), 0.0)
+            grad_probability = tl.dot(grad_output, tl.trans(value))
+            grad_score = probability * (grad_probability - delta[:, None])
+            if DTYPE_CODE == 1:
+                grad_key += tl.dot(tl.trans(grad_score.to(tl.bfloat16)), query)
+                grad_value += tl.dot(tl.trans(probability.to(tl.bfloat16)), grad_output)
+            else:
+                grad_key += tl.dot(tl.trans(grad_score.to(tl.float16)), query)
+                grad_value += tl.dot(tl.trans(probability.to(tl.float16)), grad_output)
+
+        tl.store(grad_key_ptr + key_offset, grad_key * scale, mask=key_mask)
+        tl.store(grad_value_ptr + value_offset, grad_value, mask=value_mask)
+
+    def _na_check(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        table: torch.Tensor,
+        height: int,
+        width: int,
+        key_height: int,
+        key_width: int,
+        window_y: int,
+        window_x: int,
+        has_table: bool,
+    ) -> None:
+        batch, num_heads, tokens, _ = query.shape
+        if (
+            key.shape[:2] != query.shape[:2]
+            or key.shape[3] != query.shape[3]
+            or value.shape[:3] != key.shape[:3]
+            or key.shape[2] != key_height * key_width
+        ):
+            raise ValueError("NA query/key/value shapes do not match")
+        if tokens != height * width or not (
+            1 <= window_y <= key_height and 1 <= window_x <= key_width
+        ):
+            raise ValueError("NA kernel needs a full map at least one window wide")
+        if has_table and table.shape != (
+            (2 * window_y - 1) * (2 * window_x - 1),
+            num_heads,
+        ):
+            raise ValueError("NA relative-bias table has the wrong shape")
+        if any(not t.is_contiguous() for t in (query, key, value)) or batch < 1:
+            raise ValueError("NA kernel expects contiguous non-empty query/key/value")
+
+    def _na_meta(
+        query: torch.Tensor,
+        value: torch.Tensor,
+        window_y: int,
+        window_x: int,
+        has_table: bool,
+        dtype_code: int,
+    ) -> dict[str, Any]:
+        return {
+            "QK_DIM": query.shape[-1],
+            "V_DIM": value.shape[-1],
+            "WINDOW_Y": window_y,
+            "WINDOW_X": window_x,
+            "HAS_TABLE": has_table,
+            "DTYPE_CODE": dtype_code,
+            "TILE": _NA_TILE,
+            "BLOCK_QK": triton.next_power_of_2(query.shape[-1]),
+            "BLOCK_V": triton.next_power_of_2(value.shape[-1]),
+        }
+
+    @triton_op("dual_standalone::neighborhood_attention", mutates_args={})
+    def _neighborhood_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        table: torch.Tensor,
+        height: int,
+        width: int,
+        key_height: int,
+        key_width: int,
+        window_y: int,
+        window_x: int,
+        stride: int,
+        scale: float,
+        has_table: bool,
+        dtype_code: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _na_check(
+            query,
+            key,
+            value,
+            table,
+            height,
+            width,
+            key_height,
+            key_width,
+            window_y,
+            window_x,
+            has_table,
+        )
+        batch, num_heads, tokens, _ = query.shape
+        output = torch.empty(
+            (*query.shape[:3], value.shape[-1]),
+            device=value.device,
+            dtype=value.dtype,
+        )
+        lse = torch.empty(
+            (batch, num_heads, tokens), device=query.device, dtype=torch.float32
+        )
+        tiles = triton.cdiv(height, _NA_TILE) * triton.cdiv(width, _NA_TILE)
+        wrap_triton(_na_forward_kernel)[(tiles, batch * num_heads)](
+            query,
+            key,
+            value,
+            table,
+            output,
+            lse,
+            *query.stride()[:3],
+            *key.stride()[:3],
+            *value.stride()[:3],
+            *output.stride()[:3],
+            *table.stride(),
+            height,
+            width,
+            num_heads,
+            key_height=key_height,
+            key_width=key_width,
+            STRIDE=stride,
+            scale=scale,
+            BLOCKS_Y=_na_blocks(window_y, stride),
+            BLOCKS_X=_na_blocks(window_x, stride),
+            num_warps=_NA_FWD_WARPS,
+            **_na_meta(query, value, window_y, window_x, has_table, dtype_code),
+        )
+        return output, lse
+
+    @triton_op("dual_standalone::neighborhood_attention_backward", mutates_args={})
+    def _neighborhood_attention_backward(
+        grad_output: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        table: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        height: int,
+        width: int,
+        key_height: int,
+        key_width: int,
+        window_y: int,
+        window_x: int,
+        stride: int,
+        scale: float,
+        has_table: bool,
+        dtype_code: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return dQ, dK, dV and, with a table, dS per query and window slot."""
+        grad_output = grad_output.contiguous()
+        batch, num_heads, tokens, _ = query.shape
+        delta = (output.float() * grad_output.float()).sum(-1)
+        grad_query = torch.empty_like(query)
+        grad_key = torch.empty_like(key)
+        grad_value = torch.empty_like(value)
+        # With a table every valid query writes all window slots exactly once.
+        grad_score = torch.empty(
+            (batch, num_heads, tokens, window_y * window_x) if has_table else (1,),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        tiles = triton.cdiv(height, _NA_TILE) * triton.cdiv(width, _NA_TILE)
+        grid = (tiles, batch * num_heads)
+        strides = (
+            *query.stride()[:3],
+            *key.stride()[:3],
+            *value.stride()[:3],
+            *grad_output.stride()[:3],
+            *table.stride(),
+        )
+        meta = _na_meta(query, value, window_y, window_x, has_table, dtype_code)
+        wrap_triton(_na_backward_query_kernel)[grid](
+            query,
+            key,
+            value,
+            table,
+            grad_output,
+            lse,
+            delta,
+            grad_query,
+            grad_score,
+            *strides,
+            height,
+            width,
+            num_heads,
+            key_height=key_height,
+            key_width=key_width,
+            STRIDE=stride,
+            scale=scale,
+            BLOCKS_Y=_na_blocks(window_y, stride),
+            BLOCKS_X=_na_blocks(window_x, stride),
+            num_warps=_NA_BWD_WARPS,
+            **meta,
+        )
+        key_tiles = triton.cdiv(key_height, _NA_TILE) * triton.cdiv(key_width, _NA_TILE)
+        wrap_triton(_na_backward_key_value_kernel)[(key_tiles, batch * num_heads)](
+            query,
+            key,
+            value,
+            table,
+            grad_output,
+            lse,
+            delta,
+            grad_key,
+            grad_value,
+            *strides,
+            height,
+            width,
+            num_heads,
+            key_height=key_height,
+            key_width=key_width,
+            STRIDE=stride,
+            scale=scale,
+            num_warps=_NA_BWD_WARPS,
+            **meta,
+        )
+        return grad_query, grad_key, grad_value, grad_score
+
+    def _na_offset_matrices(
+        length: int, window: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One-hot maps: position -> its offset class c = p - origin(p), and
+        (c, slot) -> table axis index c - slot + window - 1."""
+        positions = torch.arange(length, device=device)
+        origin = (positions - window // 2).clamp(0, length - window)
+        classes = torch.arange(window, device=device)
+        group = (classes[:, None] == (positions - origin)[None, :]).float()
+        relative = torch.arange(2 * window - 1, device=device)
+        place = (
+            classes[:, None, None] - classes[None, :, None] + window - 1
+            == relative[None, None, :]
+        ).float()
+        return group, place
+
+    def _na_table_gradient(
+        grad_score: torch.Tensor, height: int, width: int, window_y: int, window_x: int
+    ) -> torch.Tensor:
+        """Sum dS by query-minus-key offset without atomics.
+
+        A query's offset to window slot s is c - s with c = p - origin(p) per
+        axis, so queries are first summed by (c_y, c_x) with one-hot matmuls.
+        """
+        num_heads = grad_score.shape[1]
+        device = grad_score.device
+        group_y, place_y = _na_offset_matrices(height, window_y, device)
+        group_x, place_x = _na_offset_matrices(width, window_x, device)
+        dense = grad_score.sum(0, dtype=torch.float32).reshape(
+            num_heads, height, width, window_y, window_x
+        )
+        grouped = torch.einsum("cy,hyxuv,dx->hcduv", group_y, dense, group_x)
+        table = torch.einsum("hcduv,cui,dvj->ijh", grouped, place_y, place_x)
+        return table.reshape((2 * window_y - 1) * (2 * window_x - 1), num_heads)
+
+    def _na_setup_context(ctx, inputs, output) -> None:
+        query, key, value, table = inputs[:4]
+        attention_output, lse = output
+        ctx.save_for_backward(query, key, value, table, attention_output, lse)
+        ctx.geometry = inputs[4:]
+
+    def _na_backward_rule(ctx, grad_output: torch.Tensor, grad_lse):
+        del grad_lse
+        query, key, value, table, attention_output, lse = ctx.saved_tensors
+        height, width, _, _, window_y, window_x, _, _, has_table, _ = ctx.geometry
+        grad_query, grad_key, grad_value, grad_score = _neighborhood_attention_backward(
+            grad_output,
+            query,
+            key,
+            value,
+            table,
+            attention_output,
+            lse,
+            *ctx.geometry,
+        )
+        grad_table = (
+            _na_table_gradient(grad_score, height, width, window_y, window_x).to(
+                table.dtype
+            )
+            if has_table
+            else None
+        )
+        return grad_query, grad_key, grad_value, grad_table, *(None,) * 10
+
+    torch.library.register_autograd(
+        _neighborhood_attention,
+        _na_backward_rule,
+        setup_context=_na_setup_context,
+    )
+
+    def local_na_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        table: torch.Tensor,
+        height: int,
+        width: int,
+        window: int,
+    ) -> torch.Tensor:
+        """Local NA with a dense RPB table; (B, heads, H*W, D) maps, Q scaled."""
+        output, _lse = _neighborhood_attention(
+            query,
+            key,
+            value,
+            table,
+            height,
+            width,
+            height,
+            width,
+            window,
+            window,
+            1,
+            1.0,
+            True,
+            _attention_dtype_code(query.dtype),
+        )
+        return output
+
+    def context_na_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        height: int,
+        width: int,
+        window_y: int,
+        window_x: int,
+    ) -> torch.Tensor:
+        """Context NA; Q/K already carry the Fourier bias factors, Q is scaled."""
+        output, _lse = _neighborhood_attention(
+            query,
+            key,
+            value,
+            query.new_zeros((1, 1)),
+            height,
+            width,
+            height,
+            width,
+            window_y,
+            window_x,
+            1,
+            1.0,
+            False,
+            _attention_dtype_code(query.dtype),
+        )
+        return output
+
+    def retrieval_na_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        height: int,
+        width: int,
+        key_height: int,
+        key_width: int,
+        window_y: int,
+        window_x: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """Retrieval NA: fine queries (stride 2) over half-resolution keys."""
+        output, _lse = _neighborhood_attention(
+            query,
+            key,
+            value,
+            query.new_zeros((1, 1)),
+            height,
+            width,
+            key_height,
+            key_width,
+            window_y,
+            window_x,
+            2,
+            scale,
+            False,
+            _attention_dtype_code(query.dtype),
+        )
+        return output
+
 else:
 
     def _fused_rpb_attention(
@@ -3493,6 +4596,48 @@ else:
             f"DUAL direct CUDA attention is unavailable: {_DIRECT_ATTENTION_ERROR}. Use "
             "g_attention_impl='sdpa' and compile_g_attention_impl='sdpa' "
             "or provide the required Triton/PyTorch APIs."
+        )
+
+    def local_na_attention(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        table: Tensor,
+        height: int,
+        width: int,
+        window: int,
+    ) -> Tensor:
+        raise RuntimeError(
+            f"DUAL local NA kernel is unavailable: {_DIRECT_ATTENTION_ERROR}"
+        )
+
+    def context_na_attention(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        height: int,
+        width: int,
+        window_y: int,
+        window_x: int,
+    ) -> Tensor:
+        raise RuntimeError(
+            f"DUAL context NA kernel is unavailable: {_DIRECT_ATTENTION_ERROR}"
+        )
+
+    def retrieval_na_attention(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        height: int,
+        width: int,
+        key_height: int,
+        key_width: int,
+        window_y: int,
+        window_x: int,
+        scale: float,
+    ) -> Tensor:
+        raise RuntimeError(
+            f"DUAL retrieval NA kernel is unavailable: {_DIRECT_ATTENTION_ERROR}"
         )
 
 

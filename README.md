@@ -167,13 +167,13 @@ flowchart TB
 
 Table 3. Gathered key unions away from image borders. The union per axis is the support width plus the spread of the tile's support origins: 7 for an 8-position tile at unit stride, 15 for a 16-position tile, and 3 for an 8-position fine tile over half-resolution keys. The ratio is gathered keys divided by keys needed; a fixed partition of the same support size gathers exactly the keys it needs, so the ratio is also NA's query-key pair count relative to that partition.
 
-Context NA processes up to four 16 x 16 tiles per attention call. Local and cross-scale NA batch as many 8 x 8 tiles per call as fit a fixed element budget. Tiles of the same border class share one mask. Tiles and chunks are execution details, not heads or a change to the neighbourhood size: a per-query mask over the shared key union recovers S(p) exactly. In local layers that mask also carries the tabulated bias, with -∞ outside S(p).
+Context NA processes up to four 16 x 16 tiles per attention call. Local and cross-scale NA batch as many 8 x 8 tiles per call as fit a fixed element budget. Tiles of the same border class share one mask. Tiles and chunks are execution details, not heads or a change to the neighbourhood size: a per-query mask over the shared key union recovers S(p) exactly. In local layers that mask also carries the tabulated bias, with -∞ outside S(p). These tiles belong to the SDPA reference path; in compiled low-precision training the bundled kernels of Section 7 read keys directly from the maps and gather nothing.
 
 ### 3.5  What NA changes
 
 The attention weights depend on query/key content and relative position; NA is not a fixed smoothing filter. Overlap occurs between donor neighbourhoods, not between separately predicted outputs. With the default switches, no spatial attention operator has a partition border inside the image. Other components retain their own boundary behavior: convolution borders, PU2, the regional mixer's blended windows, and per-image routing. NA complements these components rather than replacing them.
 
-NA specifies which pixels can interact. SDPA and FlexAttention specify how that attention is executed. The optional Flex path preserves the same per-query support and learned Fourier factors; enabling it is not an architectural switch from window attention to NA. Backend changes can nevertheless alter floating-point rounding, latency, and memory use.
+NA specifies which pixels can interact. SDPA, FlexAttention, and the bundled kernels specify how that attention is executed. The optional Flex path preserves the same per-query support and learned Fourier factors; enabling it is not an architectural switch from window attention to NA. Backend changes can nevertheless alter floating-point rounding, latency, and memory use.
 
 ## 4  Fourier bias and regional channel mixing
 
@@ -305,21 +305,21 @@ prepare_for_export() folds static factors in FP64 on an eval copy and retains in
 | local_na | True | NA in local G16 layers; False restores owned windows |
 | retrieval_na | True | Cross-scale NA; False restores 96 x 96 trunk blocks |
 | use_checkpoint | True | Selective whole-layer activation checkpointing |
-| attn_type | masked | SDPA for NA; hybrid opts into eligible compiled Flex calls |
-| g_attention_impl | sdpa | Eager local attention path |
-| compile_g_attention_impl | direct | Eligible fixed-window local path after preparation (local_na=False only) |
+| attn_type | masked | Reference and kernel paths for NA; hybrid opts into eligible compiled Flex calls |
+| g_attention_impl | sdpa | Eager attention path; direct selects the bundled kernels in eager training |
+| compile_g_attention_impl | direct | Bundled kernels after preparation: fixed local windows and the three NA uses |
 
 Table 5. Effective execution defaults for all presets and scales. Section 3.3 details the fixed partitions that the three switches restore. Activation checkpointing is distinct from saving training state. NA remains enabled under both attention backend choices.
 
-Local NA and cross-scale NA have one execution path in every mode: index gathers and masked SDPA, in eager execution, after prepare_for_compile, with attn_type=hybrid, in evaluation, and after prepare_for_export. FlexAttention replaces only eligible context NA calls (Section 7.1).
+Each NA use has a reference path: index gathers and masked SDPA. It runs in eager execution, in evaluation, and after prepare_for_export. After prepare_for_compile, low-precision CUDA training replaces it with one bundled kernel family that reads queries, keys, and values directly from the feature maps, so no key union is gathered and no mask or attention matrix is stored. FlexAttention replaces only eligible context NA calls (Section 7.1).
 
-prepare_for_compile(input_shape, input_dtype) configures an undeployed training model using capability checks shared by every preset and output scale. With FP16/BF16 inputs, eligible full G16/G32 anchored dot-product layers can use the bundled dense-relative-bias Triton kernel; it implements fixed windows, so it is selected only for layers with local_na=False. Device, dtype, geometry, and mask checks still apply at execution. Unsupported local geometry routes to SDPA with a warning; missing direct-kernel dependencies are reported rather than silently ignored. Setting compile_g_attention_impl to sdpa keeps local attention on SDPA.
+prepare_for_compile(input_shape, input_dtype) configures an undeployed training model using capability checks shared by every preset and output scale. With FP16/BF16 inputs, one option, compile_g_attention_impl, selects the bundled Triton kernels: the dense-relative-bias fixed-window kernel for eligible full G16/G32 anchored dot-product layers with local_na=False, and the NA kernels for local NA where both map sides reach the window, for context NA with attn_type=masked and deterministic algorithms disabled, and for cross-scale NA and SecondOctaveTransfer where a coarse axis exceeds 48. Device, dtype, and geometry checks still apply at execution. Unsupported fixed-window geometry routes to SDPA with a warning; a prepared layer whose device, dtype, or missing direct-kernel dependencies rule out its kernel reports that once and uses SDPA. Setting compile_g_attention_impl to sdpa keeps every attention call on SDPA.
 
-For eligible CUDA BF16 context training with deterministic algorithms disabled, images are folded into the head dimension so one tile mask is shared across images. With attn_type=masked, this path uses SDPA and prefers cuDNN attention, then efficient attention or the math implementation according to backend support. The 32 content channels and 16 Fourier lanes give Q/K width 48, while V stays at width 32. The standard layout instead zero-pads V and slices the result. These layouts preserve the same neighbourhoods and relative coordinates.
+The NA kernels process 8 x 8 query tiles against 64-key blocks aligned to the same grid and test every query-key pair against the query's clamped neighbourhood by its coordinates. The forward pass keeps one FP32 log-sum-exp per query; the backward pass recomputes the scores and accumulates query, key, value, and bias-table gradients without atomic updates. Local NA reads its bias from the table by query-minus-key offset. Context NA appends the 16 Fourier lanes to the 32 content channels, giving Q/K width 48 while V stays at width 32. Cross-scale NA reads keys and values from the half-resolution map. With compile_g_attention_impl=sdpa, eligible CUDA BF16 context training instead folds images into the head dimension so one tile mask is shared across images, and prefers cuDNN attention within SDPA; the standard layout zero-pads V and slices the result. All of these layouts preserve the same neighbourhoods and relative coordinates.
 
 ### 7.1  Optional FlexAttention backend
 
-attn_type=hybrid replaces only eligible masked NA calls during compiled CUDA BF16 training. The Flex path requires context_na=True, the PyTorch FlexAttention/Triton backend, rank-16 Fourier bias, a 32- or 64-pixel context, and deterministic algorithms disabled. The same four-tile geometry is encoded in a BlockMask; Q/K are zero-padded from width 48 to 64 and V remains width 32. Learned Fourier factors remain differentiable Q/K operands. Local attention, in either setting, and cross-scale attention are not replaced; unmasked full-image context and eager/evaluation NA continue to use SDPA. Other dtypes and deterministic mode retain SDPA for NA.
+attn_type=hybrid replaces only eligible masked NA calls during compiled CUDA BF16 training. The Flex path requires context_na=True, the PyTorch FlexAttention/Triton backend, rank-16 Fourier bias, a 32- or 64-pixel context, and deterministic algorithms disabled. The same four-tile geometry is encoded in a BlockMask; Q/K are zero-padded from width 48 to 64 and V remains width 32. Learned Fourier factors remain differentiable Q/K operands. Local attention, in either setting, and cross-scale attention are not replaced by Flex and keep the paths above; unmasked full-image context and eager/evaluation NA continue to use SDPA. Under this setting, other dtypes and deterministic mode retain SDPA for context NA.
 
 Before compiling, move the training model to its target CUDA device and call prepare_for_compile with the actual positive BCHW RGB input shape and input_dtype=torch.bfloat16. The hook prepares reusable geometry masks, accounting for Light's PU2 padding. Re-run preparation after a device/dtype move or input-shape change; an eligible hybrid call with a missing mask raises an error. The flag alone does not compile the model. Flex and SDPA preserve the attention definition, not guaranteed bitwise equality or a fixed speedup.
 
@@ -331,9 +331,9 @@ use_checkpoint is the only activation-checkpoint option: False disables explicit
 
 ### 7.3  Evaluation and export
 
-Evaluation NA uses SDPA, not the compiled-training Flex path, and disables activation checkpointing. Eager inference without gradients reuses bounded integer-coordinate caches and computes shared key-side Fourier factors once per layer forward; learned factors are not cached across weight updates. SDPA is a dispatch API, not a guarantee that FlashAttention is available or selected. Mask, dtype, shape, platform, and backend support govern the implementation.
+Evaluation NA uses SDPA, not the compiled-training kernels or the Flex path, and disables activation checkpointing. Eager inference without gradients reuses bounded integer-coordinate caches and computes shared key-side Fourier factors once per layer forward; learned factors are not cached across weight updates. SDPA is a dispatch API, not a guarantee that FlashAttention is available or selected. Mask, dtype, shape, platform, and backend support govern the implementation.
 
-The architecture file bundles its optional direct local-attention kernels and can import without traiNNer. Export preparation resets spatial routing to SDPA, disables the BF16 training layout, clears Flex masks, and folds static convolution factors. NA support remains unchanged: context_na, local_na and retrieval_na stay as configured, and their neighbourhoods are expressed as index gathers and masked SDPA. This prepares a model copy; it does not itself generate ONNX, build a TensorRT engine, or package a TensorRT plugin. TensorRT fusion and any external NA plugin are separate deployment choices, not enabled by attn_type=hybrid.
+The architecture file bundles its optional direct attention kernels and can import without traiNNer. Export preparation resets spatial routing to SDPA, disables the BF16 training layout, clears Flex masks, and folds static convolution factors. NA support remains unchanged: context_na, local_na and retrieval_na stay as configured, and their neighbourhoods are expressed as index gathers and masked SDPA. This prepares a model copy; it does not itself generate ONNX, build a TensorRT engine, or package a TensorRT plugin. TensorRT fusion and any external NA plugin are separate deployment choices, not enabled by attn_type=hybrid.
 
 Call model.eval(), make a separate deep copy, then call prepare_for_export() on that copy. The DUAL method returns None. Keep the unfolded model and checkpoint for training or resumption.
 
@@ -359,7 +359,7 @@ Kernel composition, factor concatenation, and layout changes preserve the stated
 | G16 / C32 / C64 | Slot names: local layer (16 x 16 support) / context layer (32 x 32 or 64 x 64). |
 | Cross-scale NA | A fine query's 48 x 48 neighbourhood of coarse keys around its coarse cell. |
 | Fixed partition | Windows or blocks with borders fixed in the image; a switch set to False restores one. |
-| SDPA / Flex | Execution backends; neither changes NA's donor-support definition. |
+| SDPA / Flex / direct kernels | Execution backends; none changes NA's donor-support definition. |
 | RFB / RPB | Relative Fourier bias / tabulated relative position bias. |
 | PU2 / F64 | PixelUnshuffle by 2 / reconstruction width of 64 channels. |
 | Q / K / V | Query / key / value projections; their origins are specified for each operator. |
@@ -367,7 +367,7 @@ Kernel composition, factor concatenation, and layout changes preserve the stated
 
 ### 8.4  Changes in this revision
 
-Against the report of 1 November 2026, this revision adds two constructor switches, local_na and retrieval_na, both True by default, which extend Neighbourhood Attention from the context layers to the local layers and to cross-scale retrieval. Section 3 is restructured around one support rule; Tables 2 and 3 and Figure 4 are new.
+Against the report of 1 November 2026, this revision adds two constructor switches, local_na and retrieval_na, both True by default, which extend Neighbourhood Attention from the context layers to the local layers and to cross-scale retrieval. Section 3 is restructured around one support rule; Tables 2 and 3 and Figure 4 are new. Bundled training kernels now serve the three NA uses (Section 7); they change execution only, not the model function, parameters, or state-dictionary keys.
 
 ## References
 
