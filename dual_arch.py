@@ -30,6 +30,12 @@ Spatial attention (one support rule in three places):
     32/64, coarse 48 per axis) take the single-window path under either setting.
     A separate regional channel mixer follows each context attention.
     Neighborhood attention does not blend overlapping output predictions.
+    routing_na: each position routes the group convolutions' experts from the
+    mean over its clamped 96x96 neighborhood. Default False (image routing);
+    maps of at most 96 per axis give the same function under either setting.
+    regional_na: each position's regional channel attention comes from its
+    clamped 32x32 neighborhood. Default False (four-grid blend); maps of at most
+    16 per axis give the same function under either setting.
 
 Convolution and reconstruction:
     EDBB factors compose a dense kernel differentiably before applying it.
@@ -133,6 +139,7 @@ def _selective_checkpoint_policy(
     if _HAS_DIRECT_ATTENTION and op in (
         torch.ops.dual_standalone.dense_rpb_attention.default,
         torch.ops.dual_standalone.neighborhood_attention.default,
+        torch.ops.dual_standalone.regional_na.default,
     ):
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
@@ -581,6 +588,55 @@ def _inference_na_coordinates(height: int, width: int, device: torch.device) -> 
 
 # Attention elements per SDPA call before tiled local/retrieval NA splits tiles.
 _NA_ELEMENT_CAP = 2**27
+# Neighborhood sides of routing_na and regional_na.
+_ROUTING_REACH, _REGIONAL_REACH = 96, 32
+
+
+def _neighborhood_rows(rows: range, k: int, length: int) -> range:
+    """The map rows that the clamped k-row neighborhoods of `rows` cover."""
+
+    def start(p: int) -> int:
+        return min(max(p - k // 2, 0), length - k)
+
+    return range(start(rows.start), start(rows.stop - 1) + k)
+
+
+def _neighborhood_sum(
+    z: Tensor, ky: int, kx: int, rows: range, height: int, cols: range, width: int
+) -> Tensor:
+    """Sums over each position's clamped ky x kx neighborhood (start = clamp(p - k // 2,
+    0, L - k) per axis) for the rows `rows` and columns `cols` of a height x width map.
+
+    z is (N, len(row span), len(column span)) and holds the spans
+    _neighborhood_rows(rows, ky, height) and _neighborhood_rows(cols, kx, width).
+    """
+    sums = F.avg_pool2d(z, (ky, 1), 1, divisor_override=1)
+    sums = F.avg_pool2d(sums, (1, kx), 1, divisor_override=1)
+    for axis, (part, k, length) in enumerate(((rows, ky, height), (cols, kx, width))):
+        first = _neighborhood_rows(part, k, length).start
+        starts = torch.arange(part.start, part.stop, device=z.device) - k // 2
+        sums = sums.index_select(axis - 2, starts.clamp(0, length - k) - first)
+    return sums
+
+
+def _window_band(length: int, k: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+    """(length, length - k + 1) 0/1 matrix: column s holds ones on rows [s, s + k)."""
+    rows = torch.arange(length, device=device)[:, None]
+    starts = torch.arange(length - k + 1, device=device)[None, :]
+    return ((rows >= starts) & (rows < starts + k)).to(dtype)
+
+
+def _neighborhood_means(x: Tensor, ky: int, kx: int, dtype: torch.dtype) -> Tensor:
+    """Means of x (B, C, H, W) over the ky x kx windows starting at every row and
+    column a clamped neighborhood starts at: (B, H - ky + 1, W - kx + 1, C) in dtype.
+    The window sums as contractions with a 0/1 band matrix per axis (no running
+    sums, so no cancellation)."""
+    height, width = x.shape[-2:]
+    rows = _window_band(height, ky, dtype, x.device)
+    columns = _window_band(width, kx, dtype, x.device)
+    sums = torch.einsum("bchw,hi,wj->bijc", x.to(dtype), rows, columns)
+    return sums / (ky * kx)
+
 
 
 @dataclass
@@ -1532,6 +1588,8 @@ class RegionalChannelAttention(nn.Module):
     Each region forms a per-head channel-mixing matrix from normalized feature
     correlations. Separable hat weights blend the four grid outputs. Border
     normalization counts real pixels, not padding; the caller adds the residual.
+    With regional_na each position instead takes the matrix of its own clamped
+    32x32 window (see mix); 32-channel heads only, other head widths keep the blend.
     """
 
     def __init__(self, channels: int = 96, heads: int = 3) -> None:
@@ -1547,6 +1605,9 @@ class RegionalChannelAttention(nn.Module):
         self.project = nn.Conv2d(channels, channels, 1, bias=False)
         self.theta = nn.Parameter(torch.zeros(heads))
         self.apply(_init_weights)
+        # DUAL sets this from its regional_na switch (see mix).
+        self.regional_na = False
+        self.kernel_fallback_reported = False
 
     def channel_attention(self, q: Tensor, k: Tensor, count: Tensor) -> Tensor:
         """(..., heads, d, tokens) -> (..., heads, d, d), FP32 or FP64.
@@ -1599,8 +1660,102 @@ class RegionalChannelAttention(nn.Module):
             wx = hat_weights(w, sx, device=q.device, dtype=a.dtype)
             return o * wy[None, None, :, None] * wx[None, None, None, :]
 
+    def _mix_na(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """regional_na's per-position form. Each position's channel attention (Gram,
+        lengths + count * 1e-6, cosine * tau, softmax) comes from its own clamped
+        32x32 neighborhood and is applied to its own v, in the dtypes of
+        channel_attention and _class_core. The b*d*d*H*W Gram field is never whole:
+        one head and one band of rows at a time, under _NA_ELEMENT_CAP elements; where
+        one row's neighborhood rows already pass it, bands of single rows and of
+        columns."""
+        b, c, h, w = q.shape
+        d = c // self.heads
+        ky, kx = min(_REGIONAL_REACH, h), min(_REGIONAL_REACH, w)
+        dtype = calculation_dtype(q.dtype)
+        band = _NA_ELEMENT_CAP // (b * d * d * w) - ky + 1
+        columns = w
+        if band < 1:
+            band = 1
+            columns = max(1, _NA_ELEMENT_CAP // (b * d * d * ky) - kx + 1)
+        out = torch.empty(b, c, h, w, device=q.device, dtype=dtype)
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            tau = self.theta.to(dtype).clamp(max=math.log(100)).exp()
+            for head in range(self.heads):
+                channels = slice(head * d, (head + 1) * d)
+                for first in range(0, h, band):
+                    rows = range(first, min(first + band, h))
+                    span = _neighborhood_rows(rows, ky, h)
+                    for left in range(0, w, columns):
+                        cols = range(left, min(left + columns, w))
+                        reach = _neighborhood_rows(cols, kx, w)
+                        qh = q[:, channels, span.start : span.stop, reach.start : reach.stop]
+                        kh = k[:, channels, span.start : span.stop, reach.start : reach.stop]
+                        qh, kh = qh.to(dtype), kh.to(dtype)
+
+                        def box(
+                            t: Tensor,
+                            rows: range = rows,
+                            span: range = span,
+                            cols: range = cols,
+                            reach: range = reach,
+                        ) -> Tensor:
+                            sums = _neighborhood_sum(
+                                t.reshape(-1, len(span), len(reach)), ky, kx, rows, h, cols, w
+                            )
+                            return sums.reshape(*t.shape[:-2], len(rows), len(cols))
+
+                        q_norm = (box(qh.square()) + ky * kx * 1e-6).sqrt()
+                        k_norm = (box(kh.square()) + ky * kx * 1e-6).sqrt()
+                        gram = box(qh[:, :, None] * kh[:, None])
+                        cosine = gram / (q_norm[:, :, None] * k_norm[:, None])
+                        a = (cosine * tau[head]).softmax(2)
+                        vh = v[:, channels, rows.start : rows.stop, cols.start : cols.stop]
+                        # A matrix product per position, as in _class_core.
+                        o = (
+                            a.to(v.dtype).permute(0, 3, 4, 1, 2)
+                            @ vh.permute(0, 2, 3, 1)[..., None]
+                        )
+                        out[:, channels, rows.start : rows.stop, cols.start : cols.stop] = (
+                            o[..., 0].permute(0, 3, 1, 2).to(dtype)
+                        )
+        return out
+
     def mix(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        """Blend four class outputs without an H*W*d*d matrix field."""
+        """Blend four class outputs without an H*W*d*d matrix field.
+
+        With regional_na, 32-channel heads and a side over 16, the per-position form
+        instead: the bundled kernels in CUDA BF16/FP16 training, the reference form
+        (_mix_na) elsewhere. Every export path (ONNX, torch.export) keeps the blend:
+        the reference form's pooling sums do not export.
+        """
+        h, w = q.shape[-2:]
+        # Up to 16 positions per axis every class has one window holding the whole
+        # map and the hats sum to 1: the blend is then the per-position form.
+        if (
+            self.regional_na
+            and (h > 16 or w > 16)
+            and q.shape[1] // self.heads == 32
+            and not (torch.onnx.is_in_onnx_export() or torch.compiler.is_exporting())
+        ):
+            # Training calls on CUDA in BF16/FP16 with both sides at least one
+            # window take the kernels; everything else the reference form.
+            if (
+                self.training
+                and min(h, w) >= _REGIONAL_REACH
+                and q.device.type == "cuda"
+                and q.dtype in (torch.bfloat16, torch.float16)
+            ):
+                if _HAS_DIRECT_ATTENTION:
+                    tau = self.theta.float().clamp(max=math.log(100)).exp()
+                    return regional_na_attention(q, k, v, tau)
+                if not self.kernel_fallback_reported:
+                    self.kernel_fallback_reported = True
+                    warnings.warn(
+                        "DUAL regional NA kernel unavailable "
+                        f"({_DIRECT_ATTENTION_ERROR}); using the reference form",
+                        stacklevel=2,
+                    )
+            return self._mix_na(q, k, v)
         result = None
         for sy, sx in ((0, 0), (0, 16), (16, 0), (16, 16)):
             out = self._class_core(q, k, v, sy, sx)
@@ -1840,13 +1995,24 @@ class DynamicRouter(nn.Module):
         self.fc1 = nn.Linear(channels, channels // 4, device=device, dtype=dtype)
         self.fc2 = nn.Linear(channels // 4, experts, device=device, dtype=dtype)
         nn.init.zeros_(self.fc2.bias)
+        # DUAL sets this from its routing_na switch: (B, K, H, W) coefficients, each
+        # position routed from the mean over its clamped 96x96 neighborhood.
+        self.routing_na = False
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = (
             torch.float64 if self.fc1.weight.dtype == torch.float64 else torch.float32
         )
+        height, width = x.shape[-2:]
+        # Up to 96 positions per axis the neighborhood is the whole map.
+        na = self.routing_na and (height > _ROUTING_REACH or width > _ROUTING_REACH)
+        # One mean per distinct window; positions sharing one share its route.
+        ky, kx = min(_ROUTING_REACH, height), min(_ROUTING_REACH, width)
         with torch.autocast(device_type=x.device.type, enabled=False):
-            pooled = x.mean((2, 3), dtype=dtype)
+            if na:
+                pooled = _neighborhood_means(x, ky, kx, dtype)
+            else:
+                pooled = x.mean((2, 3), dtype=dtype)
             normalized = F.layer_norm(pooled, (self.channels,), eps=1e-5)
             hidden = F.gelu(
                 F.linear(normalized, self.fc1.weight.to(dtype), self.fc1.bias.to(dtype))
@@ -1854,20 +2020,55 @@ class DynamicRouter(nn.Module):
             logits = F.linear(
                 hidden, self.fc2.weight.to(dtype), self.fc2.bias.to(dtype)
             )
-            return (logits.softmax(-1) - 1.0 / self.num_experts)[:, :, None, None]
+            coefficients = logits.softmax(-1) - 1.0 / self.num_experts
+            if na:
+                # Position p's window starts at clamp(p - k // 2, 0, L - k): the
+                # grid of window starts, replicate-padded to the map.
+                return F.pad(
+                    coefficients.permute(0, 3, 1, 2),
+                    (kx // 2, kx - 1 - kx // 2, ky // 2, ky - 1 - ky // 2),
+                    mode="replicate",
+                )
+            return coefficients[:, :, None, None]
 
 
 def _premixed_conv3x3(
     x: Tensor, weight0: Tensor, bias0: Tensor, experts: Tensor, coefficients: Tensor
 ) -> Tensor:
-    """One differentiable mixed kernel per sample, including batch > 1."""
+    """One differentiable mixed kernel per sample, including batch > 1.
+
+    Per-position coefficients (B, K, H, W) from routing_na mix the experts' outputs
+    instead, base + sum_k c_k(p) * conv_k, summed in the calculation dtype. The
+    coefficients sum to zero (softmax - 1/K), so the last expert's term folds into
+    the others: base + sum_{k<K} c_k(p) * conv(W_k - W_K), one part fewer.
+    """
     batch, channels, height, width = x.shape
+    dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
+    if coefficients.shape[-2:] != (1, 1):
+        count = experts.shape[0] - 1
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kernels = experts.to(dtype).reshape(count + 1, channels, channels, 3, 3)
+            weight = torch.cat(
+                (
+                    weight0.to(dtype),
+                    (kernels[:-1] - kernels[-1]).reshape(count * channels, channels, 3, 3),
+                )
+            )
+            bias = torch.cat((bias0.to(dtype), bias0.new_zeros(count * channels, dtype=dtype)))
+        convolved = F.conv2d(x, weight.to(experts.dtype), bias.to(experts.dtype), padding=1)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            parts = convolved.to(dtype).unflatten(1, (count + 1, channels))
+            output = parts[:, 0] + (
+                coefficients[:, :count, None].to(dtype) * parts[:, 1:]
+            ).sum(1)
+        # A convolution's rounding depends on the layout of its input; keep x's.
+        layout = torch.contiguous_format if x.is_contiguous() else torch.channels_last
+        return output.to(convolved.dtype).contiguous(memory_format=layout)
     # The batch becomes the convolution's groups, which Inductor needs as an
     # integer. len(range()) makes it concrete under torch.compile (int() keeps
     # it symbolic), so a new batch size compiles its own static graph instead
     # of a dynamic one with symbolic groups.
     batch = len(range(batch))
-    dtype = torch.float64 if experts.dtype == torch.float64 else torch.float32
     with torch.autocast(device_type=x.device.type, enabled=False):
         residual = coefficients.reshape(batch, experts.shape[0]).to(dtype) @ (
             experts.reshape(experts.shape[0], -1).to(dtype)
@@ -2065,6 +2266,8 @@ class DUAL(nn.Module):
         context_overlap: bool | None = None,
         local_na: bool = True,
         retrieval_na: bool = True,
+        routing_na: bool = False,
+        regional_na: bool = False,
         g_window: int = 16,
         norm: Literal["token"] = "token",
         c_pos_bias: str = "rfb",
@@ -2081,7 +2284,12 @@ class DUAL(nn.Module):
         if type(use_checkpoint) is not bool:
             raise ValueError("use_checkpoint must be a bool")
         context_na = _resolve_context_na(context_na, context_overlap, default=True)
-        for name, value in (("local_na", local_na), ("retrieval_na", retrieval_na)):
+        for name, value in (
+            ("local_na", local_na),
+            ("retrieval_na", retrieval_na),
+            ("routing_na", routing_na),
+            ("regional_na", regional_na),
+        ):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be a bool")
         if local_na and qk != "dot":
@@ -2133,8 +2341,12 @@ class DUAL(nn.Module):
         self.context_na = context_na
         self.local_na = local_na
         self.retrieval_na = retrieval_na
+        self.routing_na = routing_na
+        self.regional_na = regional_na
         self.compile_cache_key_tag = (
             f"dual-family-attention-v10:selective-checkpoint={use_checkpoint}"
+            + (":routing-na" if routing_na else "")
+            + (":regional-na" if regional_na else "")
         )
         self.unshuffle = pixel_unshuffle
         self.internal_scale = scale * (2 if pixel_unshuffle else 1)
@@ -2185,6 +2397,7 @@ class DUAL(nn.Module):
                 group.layers[index].attention.local_na = local_na
             for index in (2, 5):
                 group.layers[index] = DualContextLayer(group.layers[index])
+                group.layers[index].dual.regional_na = regional_na
                 group.layers[index].attention.context_na = context_na
         for group, indices in zip(self.groups, selected, strict=True):
             group.layers = nn.ModuleList(group.layers[i] for i in indices)
@@ -2223,6 +2436,7 @@ class DUAL(nn.Module):
                         self.get_submodule(name), dynamic_experts
                     ),
                 )
+                self.get_submodule(name).router.routing_na = routing_na
 
     @property
     def context_overlap(self) -> bool:
@@ -4383,7 +4597,293 @@ if _HAS_DIRECT_ATTENTION:
         )
         return output
 
+    # regional_na for training: one program per (batch * head, window column)
+    # slides its 32x32 window down the rows, adding the entering row's Gram and
+    # lengths and subtracting the leaving row's (FP32 sums), and applies each
+    # window's channel attention to the positions whose clamped window it is.
+    # Nothing but q, k and v is kept for the backward, which recomputes the
+    # windows the same way.
+
+    @triton.jit
+    def _regional_window_rows(
+        Q, K, base, rows_off, row, sx, W, cols, G, lq, lk, sign: tl.constexpr
+    ):
+        offs = base + rows_off + row * W + sx + cols[None, :]
+        qt = tl.load(Q + offs)
+        kt = tl.load(K + offs)
+        qf, kf = qt.to(tl.float32), kt.to(tl.float32)
+        if sign > 0:
+            G += tl.dot(qt, tl.trans(kt))
+            lq += tl.sum(qf * qf, 1)
+            lk += tl.sum(kf * kf, 1)
+        else:
+            G -= tl.dot(qt, tl.trans(kt))
+            lq -= tl.sum(qf * qf, 1)
+            lk -= tl.sum(kf * kf, 1)
+        return G, lq, lk
+
+    @triton.jit
+    def _regional_window_tiles(
+        Q, K, base, rows_off, row, sx, W, cols, G, lq, lk, sign: tl.constexpr
+    ):
+        offs = base + rows_off + row * W + sx + cols[None, :]
+        qt = tl.load(Q + offs)
+        kt = tl.load(K + offs)
+        qf, kf = qt.to(tl.float32), kt.to(tl.float32)
+        ones = tl.zeros_like(qf) + 1.0
+        if sign > 0:
+            G += tl.dot(qt, tl.trans(kt))
+            lq += tl.dot(qf * qf, tl.trans(ones), input_precision="tf32")
+            lk += tl.dot(ones, tl.trans(kf * kf), input_precision="tf32")
+        else:
+            G -= tl.dot(qt, tl.trans(kt))
+            lq -= tl.dot(qf * qf, tl.trans(ones), input_precision="tf32")
+            lk -= tl.dot(ones, tl.trans(kf * kf), input_precision="tf32")
+        return G, lq, lk
+
+    @triton.jit
+    def _regional_forward_kernel(
+        Q, K, V, TAU, OUT, H, W, NY, NX, HEADS, CHW, HW, eps,
+        D: tl.constexpr, KY: tl.constexpr, KX: tl.constexpr,
+    ):
+        bh = tl.program_id(0)
+        sx = tl.program_id(1)
+        head = bh % HEADS
+        base = (bh // HEADS).to(tl.int64) * CHW + (head * D).to(tl.int64) * HW
+        channels = tl.arange(0, D)
+        rows_off = channels[:, None].to(tl.int64) * HW
+        cols = tl.arange(0, KX)
+        tau = tl.load(TAU + head).to(tl.float32)
+        G = tl.zeros((D, D), dtype=tl.float32)
+        lq = tl.zeros((D, D), dtype=tl.float32)
+        lk = tl.zeros((D, D), dtype=tl.float32)
+        for row in range(KY):
+            G, lq, lk = _regional_window_tiles(Q, K, base, rows_off, row, sx, W, cols, G, lq, lk, 1)
+        x_lo = tl.where(sx == 0, 0, sx + KX // 2)
+        x_hi = tl.where(sx == NX - 1, W - 1, sx + KX // 2)
+        out_cols = x_lo + cols
+        col_mask = out_cols <= x_hi
+        for sy in range(NY):
+            if sy > 0:
+                G, lq, lk = _regional_window_tiles(Q, K, base, rows_off, sy + KY - 1, sx, W, cols, G, lq, lk, 1)
+                G, lq, lk = _regional_window_tiles(Q, K, base, rows_off, sy - 1, sx, W, cols, G, lq, lk, -1)
+            score = G * (tl.rsqrt((lq + eps) * (lk + eps)) * tau)
+            score = tl.exp(score - tl.max(score, 1)[:, None])
+            attention = (score * (1.0 / tl.sum(score, 1))[:, None]).to(V.dtype.element_ty)
+            y_lo = tl.where(sy == 0, 0, sy + KY // 2)
+            y_hi = tl.where(sy == NY - 1, H - 1, sy + KY // 2)
+            for row in range(y_lo, y_hi + 1):
+                offs = base + rows_off + row * W + out_cols[None, :]
+                value = tl.load(V + offs, mask=col_mask[None, :], other=0.0)
+                tl.store(OUT + offs, tl.dot(attention, value), mask=col_mask[None, :])
+
+    @triton.jit
+    def _regional_backward_kernel(
+        Q, K, V, GO, TAU, GV, GG, GLQ, GLK, GTAU, RING, RINGQ, RINGK, H, W, NY, NX, HEADS, CHW, HW, eps,
+        D: tl.constexpr, KY: tl.constexpr, KX: tl.constexpr,
+    ):
+        # Per window: gv for the positions it serves, its Gram gradient and its
+        # two length gradients, and a partial sum for tau; no atomics (every
+        # position is served by exactly one window).
+        bh = tl.program_id(0)
+        sx = tl.program_id(1)
+        head = bh % HEADS
+        base = (bh // HEADS).to(tl.int64) * CHW + (head * D).to(tl.int64) * HW
+        channels = tl.arange(0, D)
+        rows_off = channels[:, None].to(tl.int64) * HW
+        cols = tl.arange(0, KX)
+        tau = tl.load(TAU + head).to(tl.float32)
+        G = tl.zeros((D, D), dtype=tl.float32)
+        lq = tl.zeros((D,), dtype=tl.float32)
+        lk = tl.zeros((D,), dtype=tl.float32)
+        tau_sum = tl.zeros((D,), dtype=tl.float32)
+        square = channels[:, None] * D + channels[None, :]
+        ring = (bh.to(tl.int64) * NX + sx) * KY
+        acc = tl.zeros((D, D), dtype=tl.float32)
+        acc_q = tl.zeros((D,), dtype=tl.float32)
+        acc_k = tl.zeros((D,), dtype=tl.float32)
+        for row in range(KY):
+            G, lq, lk = _regional_window_rows(Q, K, base, rows_off, row, sx, W, cols, G, lq, lk, 1)
+        x_lo = tl.where(sx == 0, 0, sx + KX // 2)
+        x_hi = tl.where(sx == NX - 1, W - 1, sx + KX // 2)
+        out_cols = x_lo + cols
+        col_mask = out_cols <= x_hi
+        for sy in range(NY):
+            if sy > 0:
+                G, lq, lk = _regional_window_rows(Q, K, base, rows_off, sy + KY - 1, sx, W, cols, G, lq, lk, 1)
+                G, lq, lk = _regional_window_rows(Q, K, base, rows_off, sy - 1, sx, W, cols, G, lq, lk, -1)
+            rq = tl.rsqrt(lq + eps)
+            rk = tl.rsqrt(lk + eps)
+            cosine = G * rq[:, None] * rk[None, :]
+            score = cosine * tau
+            score = tl.exp(score - tl.max(score, 1)[:, None])
+            attention = score * (1.0 / tl.sum(score, 1))[:, None]
+            low = attention.to(V.dtype.element_ty)
+            grad_attention = tl.zeros((D, D), dtype=tl.float32)
+            y_lo = tl.where(sy == 0, 0, sy + KY // 2)
+            y_hi = tl.where(sy == NY - 1, H - 1, sy + KY // 2)
+            for row in range(y_lo, y_hi + 1):
+                offs = base + rows_off + row * W + out_cols[None, :]
+                value = tl.load(V + offs, mask=col_mask[None, :], other=0.0)
+                grad_out = tl.load(GO + offs, mask=col_mask[None, :], other=0.0).to(V.dtype.element_ty)
+                grad_attention += tl.dot(grad_out, tl.trans(value))
+                tl.store(GV + tl.trans(offs), tl.dot(tl.trans(grad_out), low), mask=col_mask[:, None])
+            grad_score = attention * (grad_attention - tl.sum(grad_attention * attention, 1)[:, None])
+            weighted = grad_score * cosine
+            row_weighted = tl.sum(weighted, 1)
+            tau_sum += row_weighted
+            grad_lq = (-0.5 * tau) * row_weighted * rq * rq
+            grad_lk = (-0.5 * tau) * tl.sum(weighted, 0) * rk * rk
+            # The ring holds the rounded value that was added, so taking it
+            # away cancels exactly.
+            gram = (grad_score * (rq * tau)[:, None] * rk[None, :]).to(RING.dtype.element_ty)
+            slot = ring + sy % KY
+            if sy >= KY:
+                acc -= tl.load(RING + slot * D * D + square).to(tl.float32)
+                acc_q -= tl.load(RINGQ + slot * D + channels)
+                acc_k -= tl.load(RINGK + slot * D + channels)
+            acc += gram.to(tl.float32)
+            acc_q += grad_lq
+            acc_k += grad_lk
+            tl.store(RING + slot * D * D + square, gram)
+            tl.store(RINGQ + slot * D + channels, grad_lq)
+            tl.store(RINGK + slot * D + channels, grad_lk)
+            at = (bh.to(tl.int64) * H + sy) * NX + sx
+            tl.store(GG + at * D * D + square, acc.to(GG.dtype.element_ty))
+            tl.store(GLQ + at * D + channels, acc_q)
+            tl.store(GLK + at * D + channels, acc_k)
+        # Rows below the last window start only lose windows.
+        for y in range(NY, H):
+            if y >= KY:
+                slot = ring + y % KY
+                acc -= tl.load(RING + slot * D * D + square).to(tl.float32)
+                acc_q -= tl.load(RINGQ + slot * D + channels)
+                acc_k -= tl.load(RINGK + slot * D + channels)
+            at = (bh.to(tl.int64) * H + y) * NX + sx
+            tl.store(GG + at * D * D + square, acc.to(GG.dtype.element_ty))
+            tl.store(GLQ + at * D + channels, acc_q)
+            tl.store(GLK + at * D + channels, acc_k)
+        tl.store(GTAU + bh.to(tl.int64) * NX + sx, tl.sum(tau_sum, 0))
+
+    @triton.jit
+    def _regional_adjoint_kernel(
+        VG, VQ, VK, Q, K, GQ, GK, NX, H, W, HEADS, CHW, HW,
+        KX: tl.constexpr, D: tl.constexpr,
+    ):
+        # Per row: running sums over the window columns sx in [x - KX + 1, x]
+        # of pass 1's per-row sums, giving each position's summed window
+        # gradients T, Uq and Uk; then grad q = T k + 2 Uq q and
+        # grad k = T^T q + 2 Uk k there.
+        bh = tl.program_id(0)
+        y = tl.program_id(1)
+        head = bh % HEADS
+        base = (bh // HEADS).to(tl.int64) * CHW + (head * D).to(tl.int64) * HW
+        channels = tl.arange(0, D)
+        square = channels[:, None] * D + channels[None, :]
+        row = (bh.to(tl.int64) * H + y) * NX
+        acc = tl.zeros((D, D), dtype=tl.float32)
+        acc_q = tl.zeros((D,), dtype=tl.float32)
+        acc_k = tl.zeros((D,), dtype=tl.float32)
+        for x in range(W):
+            if x < NX:
+                acc += tl.load(VG + (row + x) * D * D + square)
+                acc_q += tl.load(VQ + (row + x) * D + channels)
+                acc_k += tl.load(VK + (row + x) * D + channels)
+            if x >= KX:
+                acc -= tl.load(VG + (row + x - KX) * D * D + square)
+                acc_q -= tl.load(VQ + (row + x - KX) * D + channels)
+                acc_k -= tl.load(VK + (row + x - KX) * D + channels)
+            offs = base + channels.to(tl.int64) * HW + y * W + x
+            q = tl.load(Q + offs).to(tl.float32)
+            k = tl.load(K + offs).to(tl.float32)
+            tl.store(GQ + offs, tl.sum(acc * k[None, :], 1) + 2 * acc_q * q)
+            tl.store(GK + offs, tl.sum(acc * q[:, None], 0) + 2 * acc_k * k)
+
+    @triton_op("dual_standalone::regional_na", mutates_args={})
+    def _regional_na(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, tau: torch.Tensor
+    ) -> torch.Tensor:
+        batch, channels, height, width = query.shape
+        heads = tau.shape[0]
+        out = torch.empty(query.shape, device=query.device, dtype=torch.float32)
+        wrap_triton(_regional_forward_kernel)[(batch * heads, width - _REGIONAL_REACH + 1)](
+            query, key, value, tau, out, height, width,
+            height - _REGIONAL_REACH + 1, width - _REGIONAL_REACH + 1, heads,
+            channels * height * width, height * width, _REGIONAL_REACH**2 * 1e-6,
+            D=channels // heads, KY=_REGIONAL_REACH, KX=_REGIONAL_REACH,
+            num_warps=2,
+        )
+        return out
+
+    @triton_op("dual_standalone::regional_na_backward", mutates_args={})
+    def _regional_na_backward(
+        grad_out: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, channels, height, width = query.shape
+        heads = tau.shape[0]
+        d, k = channels // heads, _REGIONAL_REACH
+        ny, nx = height - k + 1, width - k + 1
+        device = query.device
+        grad_value = torch.empty(query.shape, device=device, dtype=torch.float32)
+        # Pass 1 gives each window column's gradients already summed over the
+        # window rows that hold row y; a ring keeps the last KY windows.
+        grad_gram = torch.empty((batch * heads, height, nx, d, d), device=device, dtype=torch.bfloat16)
+        grad_lq = torch.empty((batch * heads, height, nx, d), device=device, dtype=torch.float32)
+        grad_lk = torch.empty_like(grad_lq)
+        grad_tau = torch.empty((batch * heads, nx), device=device, dtype=torch.float32)
+        ring = torch.empty((batch * heads * nx, k, d, d), device=device, dtype=torch.bfloat16)
+        ring_q = torch.empty((batch * heads * nx, k, d), device=device, dtype=torch.float32)
+        ring_k = torch.empty_like(ring_q)
+        wrap_triton(_regional_backward_kernel)[(batch * heads, nx)](
+            query, key, value, grad_out, tau, grad_value, grad_gram, grad_lq, grad_lk,
+            grad_tau, ring, ring_q, ring_k, height, width, ny, nx, heads, channels * height * width,
+            height * width, k * k * 1e-6, D=d, KY=k, KX=k,
+            num_warps=2,
+        )
+        del ring, ring_q, ring_k
+        grad_q = torch.empty(query.shape, device=device, dtype=torch.float32)
+        grad_k = torch.empty(query.shape, device=device, dtype=torch.float32)
+        wrap_triton(_regional_adjoint_kernel)[(batch * heads, height)](
+            grad_gram, grad_lq, grad_lk, query, key, grad_q, grad_k, nx, height, width, heads,
+            channels * height * width, height * width, KX=k, D=d,
+        )
+        return (
+            grad_q.to(query.dtype),
+            grad_k.to(key.dtype),
+            grad_value.to(value.dtype),
+            grad_tau.reshape(batch, heads, nx).sum((0, 2)),
+        )
+
+    def _regional_setup_context(ctx, inputs, output) -> None:
+        ctx.save_for_backward(*inputs)
+
+    def _regional_backward_rule(ctx, grad_out: torch.Tensor):
+        query, key, value, tau = ctx.saved_tensors
+        return _regional_na_backward(grad_out.contiguous(), query, key, value, tau)
+
+    torch.library.register_autograd(
+        _regional_na, _regional_backward_rule, setup_context=_regional_setup_context
+    )
+
+    def regional_na_attention(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, tau: torch.Tensor
+    ) -> torch.Tensor:
+        """regional_na's per-position form on the bundled kernels: (B, C, H, W)
+        q/k/v with 32 channels per head and both sides at least 32; FP32 output."""
+        return _regional_na(query.contiguous(), key.contiguous(), value.contiguous(), tau.float().contiguous())
+
 else:
+
+    def regional_na_attention(
+        query: Tensor, key: Tensor, value: Tensor, tau: Tensor
+    ) -> Tensor:
+        raise RuntimeError(
+            f"DUAL regional NA kernel is unavailable: {_DIRECT_ATTENTION_ERROR}"
+        )
 
     def _fused_rpb_attention(
         query: Tensor,

@@ -1,6 +1,6 @@
 # DUAL: Neighbourhood Attention and Dynamic Kernel Mixing for Image Restoration
 
-Rift73 | Technical report | 14 November 2026
+Rift73 | Technical report | 15 November 2026
 
 [Typeset paper (PDF)](DUAL.pdf) · [Architecture](dual_arch.py) · [License](LICENSE)
 
@@ -61,7 +61,7 @@ Table 1. Released preset geometry. Head width is 32 and reconstruction width is 
 
 ### 2.1  Local/context schedule
 
-A full group follows the slots [G16, shifted G16, C32, G16, shifted G16, C64], followed by a dynamic 3 x 3 write-back and a group residual. G16 denotes a local layer with 16 x 16 spatial support; C32 and C64 denote context layers with 32 x 32 and 64 x 64 support. The numbers are support widths, not channel counts, and "shifted" names a slot whose ownership offset matters only for the fixed windows of Section 3.3. G layers apply spatial attention and a convolutional feed-forward network. C layers insert regional channel attention between the NA and feed-forward residuals. Light and XS retain original slot indices (0,1,2,3), (3,4,5), (0,1,2), and (0,1,2,3,4,5). They therefore retain 11 local and five context layers, including both context sizes. The three switches context_na, local_na and retrieval_na are on by default for all six presets and all supported output scales.
+A full group follows the slots [G16, shifted G16, C32, G16, shifted G16, C64], followed by a dynamic 3 x 3 write-back and a group residual. G16 denotes a local layer with 16 x 16 spatial support; C32 and C64 denote context layers with 32 x 32 and 64 x 64 support. The numbers are support widths, not channel counts, and "shifted" names a slot whose ownership offset matters only for the fixed windows of Section 3.3. G layers apply spatial attention and a convolutional feed-forward network. C layers insert regional channel attention between the NA and feed-forward residuals. Light and XS retain original slot indices (0,1,2,3), (3,4,5), (0,1,2), and (0,1,2,3,4,5). They therefore retain 11 local and five context layers, including both context sizes. The three switches context_na, local_na and retrieval_na are on by default for all six presets and all supported output scales; the optional routing_na and regional_na are off.
 
 ### 2.2  Light input packing
 
@@ -171,7 +171,7 @@ Context NA processes up to four 16 x 16 tiles per attention call. Local and cros
 
 ### 3.5  What NA changes
 
-The attention weights depend on query/key content and relative position; NA is not a fixed smoothing filter. Overlap occurs between donor neighbourhoods, not between separately predicted outputs. With the default switches, no spatial attention operator has a partition border inside the image. Other components retain their own boundary behavior: convolution borders, PU2, the regional mixer's blended windows, and per-image routing. NA complements these components rather than replacing them.
+The attention weights depend on query/key content and relative position; NA is not a fixed smoothing filter. Overlap occurs between donor neighbourhoods, not between separately predicted outputs. With the default switches, no spatial attention operator has a partition border inside the image. Other components retain their own boundary behavior: convolution borders, PU2, the regional mixer's blended windows, and per-image routing. The optional regional_na and routing_na, off by default, give these two the rule's clamped per-position supports, of reach 32 (Section 4.2) and 96 (Section 6.2). NA complements these components rather than replacing them.
 
 NA specifies which pixels can interact. SDPA and the bundled kernels specify how that attention is executed. Both preserve the same per-query support and learned Fourier factors; which one runs is not an architectural choice. Backend changes can nevertheless alter floating-point rounding, latency, and memory use.
 
@@ -194,7 +194,7 @@ After each context spatial update, a separate channel mixer processes four 32 x 
 G<sub>ab</sub> = Σ<sub>t</sub> Q<sub>at</sub>K<sub>bt</sub> / [√(Σ<sub>t</sub> Q<sub>at</sub><sup>2</sup> + nε) √(Σ<sub>t</sub> K<sub>bt</sub><sup>2</sup> + nε)]
 O = softmax(exp(min(θ, ln 100)) G) V.   (4)
 
-Gram products and softmax use FP32 for low-precision inputs, or FP64 for doubles. Probabilities are cast to the value dtype before multiplication. Separable hat weights blend the four outputs: w<sub>s</sub>(t)=1-|((t+s) mod 32)-15.5|/16. For integer pixels, w<sub>0</sub>+w<sub>16</sub>=1, so the four 2D products sum to one. This prevents gain changes from blending weights alone; learned regional outputs can still differ. The regional mixer keeps a fixed partition, softened by blending four offset grids, rather than a per-position support.
+Gram products and softmax use FP32 for low-precision inputs, or FP64 for doubles. Probabilities are cast to the value dtype before multiplication. Separable hat weights blend the four outputs: w<sub>s</sub>(t)=1-|((t+s) mod 32)-15.5|/16. For integer pixels, w<sub>0</sub>+w<sub>16</sub>=1, so the four 2D products sum to one. This prevents gain changes from blending weights alone; learned regional outputs can still differ. By default the regional mixer keeps a fixed partition, softened by blending four offset grids, rather than a per-position support. With regional_na=True each position instead applies (4), formed over its own clamped 32 x 32 neighbourhood with n its pixel count, to its own V. This needs 32-channel heads, as in every preset, and a map side above 16; up to 16 per axis the blend already equals it. CUDA BF16/FP16 training calls with both map sides at least 32 run bundled kernels: the forward slides each 32 x 32 window down the rows with running FP32 sums (the entering row's Gram and lengths added, the leaving row's subtracted); the backward recomputes the windows, keeps a running sum of the last 32 window gradients and applies it to K and Q, saving only Q, K, V and the temperature. Other calls use a PyTorch reference form.
 
 Finally, the expansion-two feed-forward residual applies H=GELU(W<sub>1</sub>z), then W<sub>2</sub>[H+GELU(DW3x3(H))]. Main-layer token normalization uses ε=10<sup>-5</sup>, with FP32 low-precision statistics. Regional channel mixing is separate from spatial Neighbourhood Attention.
 
@@ -293,6 +293,8 @@ Convolution is linear in its kernel, so premixing is algebraically equivalent to
 
 Initially E<sub>k</sub>=0, so the dynamic correction vanishes. Expert gradients can differ through c<sub>k</sub>, while the router's data gradient through this zero bank initially vanishes. Because Σc<sub>k</sub>=0, adding one common kernel to every expert changes nothing. This is a contrast-space redundancy, not a rank bound on the effective convolution.
 
+With routing_na=True, c(p) is routed from the mean over p's clamped 96 x 96 trunk neighbourhood (Section 3.1): one FP32 (FP64 for doubles) mean per distinct window, by 0/1 band-matrix contractions, shared by the positions of that window. The convolution adds Σ<sub>k</sub> c<sub>k</sub>(p) Conv(x; E<sub>k</sub> - E<sub>K</sub>) over k up to K-1 to the base response, as one widened convolution and a per-position mix; Σc<sub>k</sub>=0 folds the last expert into the others. Maps of at most 96 per axis run (6), the same function. This holds in training and evaluation on every device and dtype; the form follows the map size.
+
 ### 6.3  What deployment can fold
 
 prepare_for_export() folds static factors in FP64 on an eval copy and retains input-dependent routing and experts. Freezing a mixed kernel observed on one image would change the model. Folding removes the training parameterization and is not a reversible training operation. Algebraic equivalence does not imply bitwise equality after low-precision casts or backend changes.
@@ -304,15 +306,19 @@ prepare_for_export() folds static factors in FP64 on an eval copy and retains in
 | context_na | True | NA in context layers; False restores anchored windows |
 | local_na | True | NA in local G16 layers; False restores owned windows |
 | retrieval_na | True | Cross-scale NA; False restores 96 x 96 trunk blocks |
+| routing_na | False | Routing per position over 96 x 96; False per image |
+| regional_na | False | Regional attention per position over 32 x 32; False blends grids |
 | use_checkpoint | True | Selective whole-layer activation checkpointing |
 
-Table 5. Effective execution defaults for all presets and scales. Section 3.3 details the fixed partitions that the three switches restore. Activation checkpointing is distinct from saving training state. The attention backend is not an option; it follows from the conditions below.
+Table 5. Effective execution defaults for all presets and scales. Section 3.3 details the fixed partitions that the first three switches restore. Activation checkpointing is distinct from saving training state. The attention backend is not an option; it follows from the conditions below.
 
 Each NA use has a reference path: index gathers and masked SDPA. It runs in evaluation, after prepare_for_export, on the CPU, and with FP32 inputs. In training on CUDA with FP16/BF16 inputs, eager or compiled, one bundled kernel family replaces it: the kernels read queries, keys, and values directly from the feature maps, so no key union is gathered and no mask or attention matrix is stored. No option selects between the two.
 
 The kernels are chosen on every call by capability checks shared by every preset and output scale: training mode, CUDA tensors, FP16/BF16 inputs, and the bundled Triton kernels available. The dense-relative-bias fixed-window kernel serves eligible full G16/G32 anchored dot-product layers with local_na=False. The NA kernels serve local NA where both map sides reach the window, context NA with deterministic algorithms disabled, and cross-scale NA and SecondOctaveTransfer where a coarse axis exceeds 48. A call that fails a check uses SDPA. When the kernels are unavailable during low-precision CUDA training, each layer reports that once rather than falling back silently. prepare_for_compile(input_shape, input_dtype) remains as the trainer's hook; it only marks eligible context layers for the BF16 SDPA layout described below.
 
 The NA kernels process 8 x 8 query tiles against 64-key blocks aligned to the same grid and test every query-key pair against the query's clamped neighbourhood by its coordinates. The forward pass keeps one FP32 log-sum-exp per query; the backward pass recomputes the scores and accumulates query, key, value, and bias-table gradients without atomic updates. Local NA reads its bias from the table by query-minus-key offset. Context NA appends the 16 Fourier lanes to the 32 content channels, giving Q/K width 48 while V stays at width 32. Cross-scale NA reads keys and values from the half-resolution map. Where the kernels cannot run, prepared CUDA BF16 context training folds images into the head dimension so one tile mask is shared across images, and prefers cuDNN attention within SDPA; the standard layout zero-pads V and slices the result. All of these layouts preserve the same neighbourhoods and relative coordinates.
+
+regional_na has its own bundled training kernels (Section 4.2); export uses the four-grid blend. routing_na is plain PyTorch, and its export needs fixed sizes.
 
 ### 7.1  Selective whole-layer checkpointing
 
@@ -358,7 +364,9 @@ Kernel composition, factor concatenation, and layout changes preserve the stated
 
 ### 8.4  Changes in this revision
 
-Against the report of 1 November 2026, this revision adds two constructor switches, local_na and retrieval_na, both True by default, which extend Neighbourhood Attention from the context layers to the local layers and to cross-scale retrieval. Section 3 is restructured around one support rule; Tables 2 and 3 and Figure 4 are new. Bundled training kernels now serve the three NA uses (Section 7); they change execution only, not the model function, parameters, or state-dictionary keys. The backend options attn_type, g_attention_impl, and compile_g_attention_impl and the FlexAttention path are removed; a configuration that still sets one of them is rejected.
+Against the report of 1 November 2026, the revision of 14 November 2026 adds two constructor switches, local_na and retrieval_na, both True by default, which extend Neighbourhood Attention from the context layers to the local layers and to cross-scale retrieval. Section 3 is restructured around one support rule; Tables 2 and 3 and Figure 4 are new. Bundled training kernels now serve the three NA uses (Section 7); they change execution only, not the model function, parameters, or state-dictionary keys. The backend options attn_type, g_attention_impl, and compile_g_attention_impl and the FlexAttention path are removed; a configuration that still sets one of them is rejected.
+
+The revision of 15 November 2026 adds routing_na and regional_na (Sections 4.2, 6.2, 7), off by default and without new parameters or keys. Compiled default-mode training ran with each on (Light, scale 2, two batch sizes), and the regional kernels' gradients were compared with the reference form; quality, GPU scale 4, max-autotune and export were not exercised.
 
 ## References
 
