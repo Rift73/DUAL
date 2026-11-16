@@ -2,7 +2,7 @@
 
 Rift73 | Technical report | 15 November 2026
 
-[Typeset paper (PDF)](DUAL.pdf) · [Architecture](dual_arch.py) · [License](LICENSE)
+[Typeset paper (PDF)](DUAL.pdf) · [Architecture](dual_arch.py) · [TensorRT converter](converter/README.md) · [License](LICENSE)
 
 Diagrams are embedded below; the PDF contains the typeset figures.
 

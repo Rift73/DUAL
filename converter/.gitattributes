@@ -1,0 +1,2 @@
+# Batch files keep their CRLF line endings in every download.
+*.bat -text

@@ -1,0 +1,193 @@
+"""CPU-only checkpoint -> TensorRT-specific ONNX."""
+
+import builtins
+import json
+from pathlib import Path
+import sys
+import types
+
+from ....checkpoint import read_state
+from .spec import (
+    CONTEXT,
+    LOCAL,
+    RETRIEVAL,
+    ROUTING,
+    SCHEMA,
+    SOURCE,
+    SOURCE_SHA256,
+    check_indexing,
+    from_model,
+    routed_parts,
+    sha256,
+)
+
+
+def load_arch():
+    """Execute canonical source unchanged, with its optional dependencies absent.
+
+    A private builtins mapping suppresses ONLY optional direct Triton attention
+    and trainer registration. It does not monkeypatch the caller's import system,
+    import other architectures, or alter DUAL's model implementation.
+    """
+    if sha256(SOURCE) != SOURCE_SHA256:
+        raise RuntimeError(
+            "Canonical dual_arch.py changed: review the lowering before exporting"
+        )
+    name = "_dual_tensorrt_canonical_source"
+    if name in sys.modules:
+        return sys.modules[name]
+    module = types.ModuleType(name)
+    module.__file__ = str(SOURCE)
+    original_import = builtins.__import__
+
+    def source_import(name, *args, **kwargs):
+        if name in ("triton", "triton.language", "traiNNer.utils.registry"):
+            raise ModuleNotFoundError(
+                "Optional dependency disabled for the export", name=name
+            )
+        return original_import(name, *args, **kwargs)
+
+    module.__dict__["__builtins__"] = {**vars(builtins), "__import__": source_import}
+    sys.modules[name] = module
+    try:
+        exec(
+            compile(SOURCE.read_text(encoding="utf-8"), str(SOURCE), "exec"),
+            module.__dict__,
+        )
+    except BaseException:
+        del sys.modules[name]
+        raise
+    return module
+
+
+def make_model(factory, scale, *, meta=False):
+    import torch
+
+    arch = load_arch()
+    with torch.device("meta" if meta else "cpu"):
+        model = getattr(arch, factory)(
+            scale=scale,
+            use_checkpoint=False,
+            context_na=True,
+        )
+    return arch, model.eval().requires_grad_(False)
+
+
+def save_onnx(model, output):
+    """output/model.onnx with its large initializers in output/weights.bin: the files of
+    onnx.save_model(save_as_external_data=True), but weights.bin is written in one pass.
+    ONNX opens and closes it once per tensor, and real-time antivirus scanning rescans
+    the growing file after each close, which makes hundreds of tensors slow. A marked
+    tensor this pass leaves holding data (a subgraph's) is still written by
+    onnx.save_model, one at a time."""
+    import onnx
+    from onnx.external_data_helper import (
+        convert_model_to_external_data,
+        set_external_data,
+        uses_external_data,
+    )
+
+    # External data avoids protobuf's 2GiB limit and keeps XL viable.
+    convert_model_to_external_data(
+        model, all_tensors_to_one_file=True, location="weights.bin", size_threshold=1024
+    )
+    external = [t for t in model.graph.initializer if uses_external_data(t)]
+    if external:
+        with open(output / "weights.bin", "wb") as weights:
+            for tensor in external:
+                offset = weights.tell()
+                weights.write(tensor.raw_data)
+                set_external_data(tensor, "weights.bin", offset, len(tensor.raw_data))
+                tensor.ClearField("raw_data")
+    onnx.save_model(model, str(output / "model.onnx"))
+
+
+def export_checkpoint(
+    factory,
+    scale,
+    height,
+    width,
+    checkpoint,
+    output,
+    *,
+    state_key=None,
+    folded=False,
+    routing_na=False,
+):
+    """routing_na: the source's expert routing per position (Graph's option of that
+    name), off by default."""
+    import onnx
+    import torch
+    from .graph import Graph
+
+    # No random/synthetic checkpoint fallback, prefix stripping, or strict=False.
+    checkpoint, output = Path(checkpoint).resolve(), Path(output).resolve()
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite export directory: {output}")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    checkpoint_sha = sha256(checkpoint)
+    torch.set_num_threads(1)
+    arch, model = make_model(factory, scale)
+    spec = from_model(model, factory, scale, height, width)
+    if routing_na:
+        check_indexing(*spec.trunk, spec.channels, routed_parts(model))
+    if folded:
+        model.prepare_for_export()
+    model.load_state_dict(read_state(checkpoint, state_key)[0], strict=True)
+    model.prepare_for_export()
+    if sha256(checkpoint) != checkpoint_sha:
+        raise RuntimeError("Checkpoint changed during export")
+    graph = Graph(
+        arch,
+        spec,
+        local_na=model.local_na,
+        retrieval_na=model.retrieval_na,
+        row_sums=True,
+        routing_na=routing_na,
+    )
+    with torch.inference_mode():
+        onnx_model = graph.build(model)
+    onnx.checker.check_model(onnx_model)
+    output.mkdir(parents=True, exist_ok=False)
+    save_onnx(onnx_model, output)
+    onnx.checker.check_model(str(output / "model.onnx"))
+    manifest = {
+        "schema": SCHEMA,
+        "status": "exported_unvalidated",
+        "source_sha256": SOURCE_SHA256,
+        "checkpoint_sha256": checkpoint_sha,
+        "state_key": state_key,
+        "checkpoint_folded": folded,
+        "specialization": spec.to_dict(),
+        "context": CONTEXT,
+        "local": LOCAL,
+        "retrieval": RETRIEVAL,
+        **(
+            {"routing": ROUTING, "routed_parts": routed_parts(model)}
+            if graph.routing_sites
+            else {}
+        ),
+        "precision": "FP32_IO_BF16_FP32_BODY",
+        "dynamic_sites": graph.dynamic_sites,
+        "plugin_names": [
+            f"Dual{part}_{spec.plugin_key}_TRT" for part in ("Norm", "Core", "Project")
+        ]
+        + (["DualAttentionBarrier_TRT"] if graph.barrier_sites else [])
+        + ([f"DualNA_{spec.plugin_key}_TRT"] if graph.na_sites else [])
+        + ([f"DualLocalNA_{spec.plugin_key}_TRT"] if graph.local_sites else [])
+        + ([f"DualXR_{spec.plugin_key}_TRT"] if graph.retrieval_sites else [])
+        + ([f"DualRowSum_{spec.plugin_key}_TRT"] if graph.row_sum_sites else [])
+        + ([f"DualBoxMean_{spec.plugin_key}_TRT"] if graph.box_mean_sites else []),
+        "files": {
+            p.name: sha256(p)
+            for p in (output / "model.onnx", output / "weights.bin")
+            if p.exists()
+        },
+        "validation": "ONNX structural checker only; custom plugin semantics and runtime NOT validated",
+    }
+    (output / "export.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    return manifest
+
